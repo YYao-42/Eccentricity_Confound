@@ -1,0 +1,7 @@
+/figures
+/tables
+/data
+.ipynb_checkpoints
+__pycache__/
+Scratch*
+/legacy
