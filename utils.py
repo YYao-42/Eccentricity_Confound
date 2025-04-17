@@ -14,6 +14,8 @@ from scipy.linalg import toeplitz, eig, eigh, sqrtm, lstsq
 from scipy.sparse.linalg import eigs
 from scipy.stats import zscore, pearsonr, binomtest, binom
 from sklearn.covariance import LedoitWolf
+from collections import Counter
+from sklearn.cluster import DBSCAN
 
 
 def eig_sorted(X, option='descending'):
@@ -251,7 +253,7 @@ def extract_freq_band(eeg, fs, band, normalize=False):
     return eeg_band
 
 
-def Hankel_mtx(L_timefilter, x, offset=0, mask=None):
+def Hankel_mtx(L_timefilter, x, offset=0):
     '''
     Calculate the Hankel matrix
     Convolution: y(t)=x(t)*h(t)
@@ -271,7 +273,6 @@ def Hankel_mtx(L_timefilter, x, offset=0, mask=None):
             ...
     x(T)   x(T-1) x(T-2)
     Unknown values are set as 0
-    If mask is not None, then discard the rows indicated by mask
     This is useful when we want to remove segments (e.g., blinks, saccades) in the signals.
     '''
     first_col = np.zeros(L_timefilter)
@@ -281,12 +282,10 @@ def Hankel_mtx(L_timefilter, x, offset=0, mask=None):
     hankel_mtx = np.transpose(toeplitz(first_col, x))
     if offset != 0:
         hankel_mtx = hankel_mtx[offset:,:]
-    if mask is not None:
-        hankel_mtx = hankel_mtx[mask,:]
     return hankel_mtx
 
 
-def block_Hankel(X, L, offset=0, mask=None):
+def block_Hankel(X, L, offset=0):
     '''
     For spatial-temporal filter, calculate the block Hankel matrix
     Inputs:
@@ -296,7 +295,7 @@ def block_Hankel(X, L, offset=0, mask=None):
     '''
     if np.ndim(X) == 1:
         X = np.expand_dims(X, axis=1)
-    Hankel_list = [Hankel_mtx(L, X[:,i], offset, mask) for i in range(X.shape[1])]
+    Hankel_list = [Hankel_mtx(L, X[:,i], offset) for i in range(X.shape[1])]
     blockHankel = np.concatenate(tuple(Hankel_list), axis=1)
     return blockHankel
 
@@ -434,7 +433,7 @@ def eval_compete(corr_att_fold, corr_unatt_fold, TRAIN_WITH_ATT, range_into_acco
     nb_correct = sum(corr_att_fold[:,:nb_comp_into_account].sum(axis=1)>corr_unatt_fold[:,:nb_comp_into_account].sum(axis=1))
     if not TRAIN_WITH_ATT:
         nb_correct = nb_test - nb_correct
-    acc = nb_correct/nb_test
+    acc = nb_correct/nb_test 
     p_value = binomtest(nb_correct, nb_test, alternative='greater').pvalue
     acc_sig = sig_level_binomial_test(0.05, nb_test)
     if message:
@@ -1035,7 +1034,7 @@ def load_subj(Subj_ID):
     return eeg_list, eog_list, gaze_list, feats_list
 
 
-def remove_shot_cuts_and_center(data, fs, time_points=None, remove_time=1):
+def remove_shot_cuts_and_center(data, fs, time_points=None, remove_time=1, CENTER=True):
     T = data.shape[0]
     if time_points is None:
         time_points = [0, T]
@@ -1045,7 +1044,8 @@ def remove_shot_cuts_and_center(data, fs, time_points=None, remove_time=1):
         nearby_idx = nearby_idx + list(range(max(0, p-len_points), min(p+len_points, T)))
     nearby_idx = list(set(nearby_idx))
     data_clean = np.delete(data, nearby_idx, axis=0)
-    data_clean = data_clean - np.mean(data_clean, axis=0)
+    if CENTER:
+        data_clean = data_clean - np.mean(data_clean, axis=0)
     return data_clean
 
 
@@ -1071,11 +1071,9 @@ def load_data(subj_path, fsStim, bads, feats_path_folder, LOAD_ONLY, ALL_NEW):
 
 
 # Check the alignment between eog and gaze. The synchronization is good if the peaks of two signals (eye blinks) are aligned.
-def check_alignment(subj_ID, eog_multisubj_list, gaze_multisubj_list, blink_multisubj_list=None, nb_points=500):
-    eog_one_subj_list = [eog[:,:,subj_ID] for eog in eog_multisubj_list]
-    gaze_one_subj_list = [gaze[:,:,subj_ID] for gaze in gaze_multisubj_list]
-    if blink_multisubj_list is not None:
-        blink_one_subj_list = [blink[:,:,subj_ID] for blink in blink_multisubj_list] 
+def check_alignment(subj_ID, task_ID, eog_multitask_list, gaze_multitask_list, nb_points=500):
+    eog_one_subj_list = [eog[:,:,task_ID-1] for eog in eog_multitask_list]
+    gaze_one_subj_list = [gaze[:,:,task_ID-1] for gaze in gaze_multitask_list]
     eog_verti_list = [eog[:,0] - eog[:,1] for eog in eog_one_subj_list]
     gaze_y_list = [gaze[:,1] for gaze in gaze_one_subj_list]
     nb_videos = len(eog_verti_list)
@@ -1087,11 +1085,9 @@ def check_alignment(subj_ID, eog_multisubj_list, gaze_multisubj_list, blink_mult
     for i in range(nb_videos):
         ax[i//nb_cols, i%nb_cols].plot(eog_verti_list[i][-nb_points:]/np.max(eog_verti_list[i][-nb_points:]), label='eog vertical')
         ax[i//nb_cols, i%nb_cols].plot(gaze_y_list[i][-nb_points:]/np.max(gaze_y_list[i][-nb_points:]), label='gaze y')
-        if blink_multisubj_list is not None:
-            ax[i//nb_cols, i%nb_cols].plot(blink_one_subj_list[i][-nb_points:], label='blink') 
         ax[i//nb_cols, i%nb_cols].set_title('Video ' + str(i+1))
         ax[i//nb_cols, i%nb_cols].legend()
-    plt.savefig('figures/Overlay/alignment_' + str(subj_ID) + '.png')
+    plt.savefig(f"figures/alignment/Subj_{subj_ID}_Task_{task_ID}.png")
 
 
 def calcu_gaze_velocity(gaze):
@@ -1121,46 +1117,6 @@ def refine_saccades(saccade_multisubj_list, blink_multisubj_list):
     saccade_multisubj_list = [np.logical_xor(np.logical_and(saccade_multisubj, blink_multisubj), saccade_multisubj) for saccade_multisubj, blink_multisubj in zip(saccade_multisubj_list, blink_multisubj_list)]
     saccade_multisubj_list = [saccade.astype(float) for saccade in saccade_multisubj_list]
     return saccade_multisubj_list
-
-
-def get_mask_list(Sacc_list, before=15, after=30, ThreeD=False):
-    mask_list = []
-    for Sacc in Sacc_list:
-        T = Sacc.shape[0]
-        Sacc = Sacc > 0.5
-        idx_surround = np.where(Sacc)[0]
-        idx_surround = np.concatenate([np.arange(i-before, i+after+1) for i in idx_surround])
-        idx_surround = np.unique(idx_surround)
-        idx_surround = idx_surround[(idx_surround>=0) & (idx_surround<T)]
-        Sacc[idx_surround] = True
-        mask = np.logical_not(Sacc)
-        if ThreeD:
-            mask = np.expand_dims(mask, axis=2)
-        mask_list.append(mask)
-    return mask_list
-
-
-def expand_mask(mask, lag, offset):
-    '''
-    If the mask will be applied to hankelized data, the mask should be expanded to cover the lags
-    '''
-    mask_correct_offset = list(np.squeeze(mask))
-    mask_correct_offset = (mask_correct_offset + offset*[True])
-    mask_exp = copy.deepcopy(mask_correct_offset)
-    for i in range(len(mask_correct_offset)):
-        if mask_correct_offset[i] == False:
-            end = min(i+lag, len(mask_correct_offset))
-            mask_exp[i:end] = (end-i)*[False]
-    return mask_exp[offset:]
-
-
-def data_loss_due_to_mask(mask_list, lag, offset):
-    '''
-    Calculate the percentage of data loss due to the mask
-    '''
-    mask_exp_list = [expand_mask(mask, lag, offset) for mask in mask_list]
-    data_loss = 1 - sum([sum(mask_exp) for mask_exp in mask_exp_list]) / sum([len(mask_exp) for mask_exp in mask_exp_list])
-    return data_loss
 
 
 def remove_saccade(datalist, Sacc, remove_before=15, remove_after=30):
@@ -1197,6 +1153,29 @@ def interpolate_blinks(ts, blinks):
             time_series[:,:,i] = clean_features(time_series[:,:,i], smooth=False)
     return time_series
     
+
+def get_mask_from_gaze(xy_multitask, saccade_multitask, blink_multitask, eps=10, nb_nearby_samples=None):
+    nb_tasks = xy_multitask.shape[2]
+    masks = []
+    for i in range(nb_tasks):
+        xy = xy_multitask[:,:,i]
+        saccade = saccade_multitask[:,0,i].astype(bool)
+        blink = blink_multitask[:,0,i].astype(bool)
+        clustering = DBSCAN(eps=eps, min_samples=5).fit(xy)
+        labels = clustering.labels_
+        # The largest cluster is likely your fixation point
+        most_common_label = Counter(labels).most_common(1)[0][0]
+        assert most_common_label != -1, "Most common label is -1, indicating noise."
+        mask_to_discard = labels != most_common_label
+        mask_to_discard = mask_to_discard & ~blink | saccade
+        if nb_nearby_samples is not None:
+            original_mask = mask_to_discard.copy()
+            for j in range(1, nb_nearby_samples + 1):
+                mask_to_discard[j:] |= original_mask[:-j]
+                mask_to_discard[:-j] |= original_mask[j:]
+        masks.append(np.expand_dims(mask_to_discard, axis=1))
+    return np.stack(masks, axis=2)
+
 
 def create_corr_df(Subj_ID, sig_corr_pool, corr_att_fold, corr_unatt_fold):
     corr_att = np.average(corr_att_fold, axis=0)
