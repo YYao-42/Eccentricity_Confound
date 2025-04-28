@@ -17,7 +17,7 @@ import utils
 
 
 class CanonicalCorrelationAnalysis:
-    def __init__(self, EEG_list, Stim_list, fs, L_EEG, L_Stim, offset_EEG=0, offset_Stim=0, dim_list_EEG=None, dim_list_Stim=None, leave_out=1, n_components=5, regularization='lwcov', message=True, signifi_level=True, p_value=0.05):
+    def __init__(self, EEG_list, Stim_list, fs, L_EEG, L_Stim, offset_EEG=0, offset_Stim=0, dim_list_EEG=None, dim_list_Stim=None, leave_out=1, n_components=5, regularization='lwcov', message=True, signifi_level=True, p_value=0.05, EEG_masked=None, Stim_masked=None):
         '''
         EEG_list: list of EEG data, each element is a T(#sample)xDx(#channel)x(#task) array corresponding to a video 
         Stim_list: list of stimulus, each element is a T(#sample)xDy(#feature dim)x(#task) array corresponding to a video 
@@ -47,6 +47,9 @@ class CanonicalCorrelationAnalysis:
         self.message = message
         self.signifi_level = signifi_level
         self.p_value = p_value
+        self.EEG_masked = EEG_masked
+        self.Stim_masked = Stim_masked
+        self.MASK = True if EEG_masked is not None and Stim_masked is not None else False
 
         self.nb_videos = len(self.Stim_list)
         assert self.nb_videos%self.leave_out == 0, "The number of videos should be a multiple of the leave_out parameter."
@@ -63,7 +66,7 @@ class CanonicalCorrelationAnalysis:
     def fit(self, X, Y):
         if np.ndim(Y) == 1:
             Y = np.expand_dims(Y, axis=1)
-        X, Y = self.apply_mask(X, Y)
+        # X, Y = self.apply_mask(X, Y)
         T, Dx = X.shape
         _, Dy = Y.shape
         Lx = self.L_EEG
@@ -71,6 +74,7 @@ class CanonicalCorrelationAnalysis:
         n_components = self.n_components
         mtx_X = utils.block_Hankel(X, Lx, self.offset_EEG)
         mtx_Y = utils.block_Hankel(Y, Ly, self.offset_Stim)
+        mtx_X, mtx_Y = self.apply_mask(mtx_X, mtx_Y)
         dim_list_X = [d*Lx for d in self.dim_list_EEG] if self.dim_list_EEG is not None else [Dx*Lx]
         dim_list_Y = [d*Ly for d in self.dim_list_Stim] if self.dim_list_Stim is not None else [Dy*Ly]
         # compute covariance matrices
@@ -107,9 +111,10 @@ class CanonicalCorrelationAnalysis:
         Y: features; V_B: filters for Y
         C: competing features
         '''
-        X, Y = self.apply_mask(X, Y)
+        # X, Y = self.apply_mask(X, Y)
         mtx_X = utils.block_Hankel(X, self.L_EEG, self.offset_EEG)
         mtx_Y = utils.block_Hankel(Y, self.L_Stim, self.offset_Stim)
+        mtx_X, mtx_Y = self.apply_mask(mtx_X, mtx_Y)
         mtx_X_centered = mtx_X - np.mean(mtx_X, axis=0, keepdims=True)
         mtx_Y_centered = mtx_Y - np.mean(mtx_Y, axis=0, keepdims=True)
         X_trans = mtx_X_centered@V_A
@@ -261,6 +266,8 @@ class CanonicalCorrelationAnalysis:
 
     def get_train_test_data(self):
         train_list_folds, test_list_folds = utils.split_multi_mod_LVO([self.EEG_list, self.Stim_list], self.leave_out)
+        if self.MASK:
+            _, test_list_folds = utils.split_multi_mod_LVO([self.EEG_masked, self.Stim_masked], self.leave_out)
         T, _, nb_tasks = train_list_folds[0][0].shape
         assert len(train_list_folds) == len(test_list_folds) == self.nb_folds, "The number of folds is not correct."
         train_list_folds = [[data[:,:,1:].transpose(2,0,1).reshape(T*2, -1) for data in EEGStim] for EEGStim in train_list_folds]
@@ -293,7 +300,7 @@ class CanonicalCorrelationAnalysis:
             print('Significance level: {}'.format(sig_corr_pool))
         return corr_train_fold, corr_test_fold, sig_corr_pool
 
-    def match_mismatch(self, trial_len, BOOTSTRAP=True, V_eeg=None, V_Stim=None, PERMU_TEST=True, overlap=0.9, given_start_points=None, MASK=False):
+    def match_mismatch(self, trial_len, BOOTSTRAP=True, V_eeg=None, V_Stim=None, PERMU_TEST=True, overlap=0.9, given_start_points=None):
         '''
         Match-Mismatch task with leave-one-pair-out
         Always train on match and try to distinguish match from mismatch 
@@ -312,7 +319,7 @@ class CanonicalCorrelationAnalysis:
                 _, V_eeg_train, V_feat_train = self.fit(EEG_train, Sti_train)
             else:
                 V_eeg_train, V_feat_train = V_eeg, V_Stim
-            if not MASK:
+            if not self.MASK:
                 corr_match_eeg_i, corr_mismatch_eeg_i, start_points, X_trans_trials, Y_att_trans_trials, Y_compete_trans_trials = self.cal_corr_compete_trials(EEG_test, Sti_test, V_eeg_train, V_feat_train, BOOTSTRAP, trial_len, given_start_points=start_points, overlap=overlap) 
                 X_all_trials = X_trans_trials + X_all_trials
                 Y_att_all_trials = Y_att_trans_trials + Y_att_all_trials
@@ -327,7 +334,7 @@ class CanonicalCorrelationAnalysis:
         corr_match_eeg = np.concatenate(tuple(corr_match_eeg), axis=0)
         corr_mismatch_eeg = np.concatenate(tuple(corr_mismatch_eeg), axis=0)
         if PERMU_TEST:
-            acc_permu_list = self.permutation_test_acc(X_all_trials, Y_att_all_trials, Y_compete_all_trials) if not MASK else self.permutation_test_acc(X_all_trials, Y_att_all_trials, Y_compete_all_trials, V_X=V_eeg_train, V_Y=V_feat_train)
+            acc_permu_list = self.permutation_test_acc(X_all_trials, Y_att_all_trials, Y_compete_all_trials) if not self.MASK else self.permutation_test_acc(X_all_trials, Y_att_all_trials, Y_compete_all_trials, V_X=V_eeg_train, V_Y=V_feat_train)
         else:
             acc_permu_list = None
         return corr_match_eeg, corr_mismatch_eeg, acc_permu_list, start_points
