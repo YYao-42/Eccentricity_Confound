@@ -1081,11 +1081,11 @@ def check_alignment(subj_ID, task_ID, eog_multitask_list, gaze_multitask_list, n
     # draw and save the plot
     nb_rows = 3
     nb_cols = nb_videos//3+1
-    fig, ax = plt.subplots(nb_rows, nb_cols, figsize=(15, 10))
+    fig, ax = plt.subplots(nb_rows, nb_cols, figsize=(15, 10), sharey=True)
     for i in range(nb_videos):
         ax[i//nb_cols, i%nb_cols].plot(eog_verti_list[i][-nb_points:]/np.max(eog_verti_list[i][-nb_points:]), label='eog vertical')
         ax[i//nb_cols, i%nb_cols].plot(gaze_y_list[i][-nb_points:]/np.max(gaze_y_list[i][-nb_points:]), label='gaze y')
-        ax[i//nb_cols, i%nb_cols].set_title('Video ' + str(i+1))
+        ax[i//nb_cols, i%nb_cols].set_title(f"Video {i+1}, gaze y max {np.max(gaze_y_list[i][-nb_points:])}")
         ax[i//nb_cols, i%nb_cols].legend()
     plt.savefig(f"figures/alignment/Subj_{subj_ID}_Task_{task_ID}.png")
 
@@ -1170,9 +1170,10 @@ def get_mask_from_gaze(xy_multitask, saccade_multitask, blink_multitask, eps=10,
         mask_to_discard = mask_to_discard & ~blink | saccade
         if nb_nearby_samples is not None:
             original_mask = mask_to_discard.copy()
-            for j in range(1, nb_nearby_samples + 1):
-                mask_to_discard[j:] |= original_mask[:-j]
-                mask_to_discard[:-j] |= original_mask[j:]
+            for bf in range(1, nb_nearby_samples[0] + 1):
+                mask_to_discard[:-bf] |= original_mask[bf:]
+            for af in range(1, nb_nearby_samples[1] + 1):
+                mask_to_discard[af:] |= original_mask[:-af]
         masks.append(np.expand_dims(mask_to_discard, axis=1))
     return np.stack(masks, axis=2)
 
