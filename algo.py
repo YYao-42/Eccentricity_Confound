@@ -58,10 +58,10 @@ class CanonicalCorrelationAnalysis:
 
     def apply_mask(self, X, Y=None):
         idx_not_nan = ~np.isnan(X).any(axis=1)
-        rt_of_not_nan = np.sum(idx_not_nan)/X.shape[0]
         if Y is not None:
             idx_not_nan = idx_not_nan & ~np.isnan(Y).any(axis=1)
             Y = Y[idx_not_nan, :]
+        rt_of_not_nan = np.sum(idx_not_nan)/X.shape[0]
         X = X[idx_not_nan, :]
         return X, Y, rt_of_not_nan
 
@@ -122,18 +122,17 @@ class CanonicalCorrelationAnalysis:
         return X_trans, Y_trans, rt_of_not_nan
     
     def get_transformed_data_3D(self, X, Y, V_A, V_B):
+        assert self.MASK is False, "This function only works for non-masked data. Otherwise the dimensions of data of different tasks will not match."
         assert np.ndim(X) == np.ndim(Y) == 3, "The input data should be 3D."
         X_trans_all = []
         Y_trans_all = []
-        rts_of_not_nan = []
         for task in range(X.shape[2]):
-            X_trans, Y_trans, rt_of_not_nan = self.get_transformed_data(X[:,:,task], Y[:,:,task], V_A, V_B)
+            X_trans, Y_trans, _ = self.get_transformed_data(X[:,:,task], Y[:,:,task], V_A, V_B)
             X_trans_all.append(X_trans)
             Y_trans_all.append(Y_trans)
-            rts_of_not_nan.append(rt_of_not_nan)
         X_trans = np.stack(X_trans_all, axis=2)
         Y_trans = np.stack(Y_trans_all, axis=2)
-        rts_of_not_nan = np.array(rts_of_not_nan).reshape(1, 1, -1)
+        rts_of_not_nan = None
         return X_trans, Y_trans, rts_of_not_nan
 
     def cal_corr_coe(self, X, Y, V_A=None, V_B=None):
@@ -191,13 +190,14 @@ class CanonicalCorrelationAnalysis:
         # Note: the data has been transformed
         X_trans_trials = utils.into_trials(X_trans, self.fs, trial_len, start_points=start_points)
         Y_att_trans_trials = utils.into_trials(Y_att_trans, self.fs, trial_len, start_points=start_points)
-        Y_compete_trans_trials = [utils.select_distractors([Y_att_trans], self.fs, trial_len, start_point)[0] for start_point in start_points]
+        Y_compete_trans_trials = utils.shift_trials(Y_att_trans_trials)
         # Y_compete_trans_trials = utils.shift_trials(Y_att_trans_trials)
         corr_att_trials, _ = self.cal_corr_coe_trials(X_trans_trials, Y_att_trans_trials, avg=False)
         corr_compete_trials, _ = self.cal_corr_coe_trials(X_trans_trials, Y_compete_trans_trials, avg=False)
         return corr_att_trials, corr_compete_trials, start_points, X_trans_trials, Y_att_trans_trials, Y_compete_trans_trials
     
     def cal_corr_compete_trials_mask(self, X, Y_att, V_X, V_Y, BOOTSTRAP, trial_len, given_start_points=None, BTfactor=2, overlap=0.9):
+        '''First divide data into trials and then apply the mask before calculating the correlation coefficients.'''
         T = X.shape[0]
         assert T-trial_len*self.fs >= 0, "The trial length is too long."
         if given_start_points is None:
@@ -212,10 +212,56 @@ class CanonicalCorrelationAnalysis:
         # Note: the data has not been transformed
         X_trials = utils.into_trials(X, self.fs, trial_len, start_points=start_points)
         Y_att_trials = utils.into_trials(Y_att, self.fs, trial_len, start_points=start_points)
-        Y_compete_trials = [utils.select_distractors([Y_att], self.fs, trial_len, start_point)[0] for start_point in start_points]
+        Y_compete_trials = utils.shift_trials(Y_att_trials)
         corr_att_trials, rts_kept_trials = self.cal_corr_coe_trials(X_trials, Y_att_trials, V_X, V_Y, avg=False)
         corr_compete_trials, _ = self.cal_corr_coe_trials(X_trials, Y_compete_trials, V_X, V_Y, avg=False)
         return corr_att_trials, corr_compete_trials, start_points, X_trials, Y_att_trials, Y_compete_trials, rts_kept_trials
+
+    def cal_corr_compete_mask_trials(self, X, Y_att, V_X, V_Y, BOOTSTRAP, trial_len, BTfactor=2, overlap=0.9):
+        '''First apply the mask and then divide data into trials.'''
+        rts_kept = []
+        corr_att_trials_tasks = []
+        corr_compete_trials_tasks = []
+        X_trans_trials_tasks = []
+        Y_att_trans_trials_tasks = []
+        Y_compete_trans_trials_tasks = []
+        min_nb_trials = np.inf
+        for task in range(X.shape[2]):
+            X_trans, Y_trans, rt_of_not_nan = self.get_transformed_data(X[:,:,task], Y_att[:,:,task], V_X, V_Y)
+            rts_kept.append(rt_of_not_nan)
+            T = X_trans.shape[0]
+            assert T-trial_len*self.fs >= 0, "The trial length is too long."
+            if BOOTSTRAP:
+                nb_trials = min(T//self.fs//BTfactor, 200)
+                start_points = np.random.randint(0, T-trial_len*self.fs, size=nb_trials)
+                start_points = np.sort(start_points)
+            else:
+                start_points = np.array(range(0, T - T%(self.fs*trial_len), round(self.fs*trial_len*(1-overlap))))
+            X_trans_trials = utils.into_trials(X_trans, self.fs, trial_len, start_points=start_points)
+            Y_att_trans_trials = utils.into_trials(Y_trans, self.fs, trial_len, start_points=start_points)
+            Y_compete_trans_trials = utils.shift_trials(Y_att_trans_trials)
+            corr_att_trials, _ = self.cal_corr_coe_trials(X_trans_trials, Y_att_trans_trials, avg=False)
+            corr_compete_trials, _ = self.cal_corr_coe_trials(X_trans_trials, Y_compete_trans_trials, avg=False)
+            corr_att_trials_tasks.append(corr_att_trials)
+            corr_compete_trials_tasks.append(corr_compete_trials)
+            X_trans_trials_tasks.append(X_trans_trials)
+            Y_att_trans_trials_tasks.append(Y_att_trans_trials)
+            Y_compete_trans_trials_tasks.append(Y_compete_trans_trials)
+            min_nb_trials = min(min_nb_trials, len(corr_att_trials))
+        # randomly select the same number of trials from each task
+        indices = [np.sort(random.sample(range(len(trials)), min_nb_trials)) for trials in corr_att_trials_tasks]
+        corr_att_trials_tasks = [trials[ind] for trials, ind in zip(corr_att_trials_tasks, indices)]
+        corr_compete_trials_tasks = [trials[ind] for trials, ind in zip(corr_compete_trials_tasks, indices)]
+        X_trans_trials_tasks = [[trials[i] for i in ind] for trials, ind in zip(X_trans_trials_tasks, indices)]
+        Y_att_trans_trials_tasks = [[trials[i] for i in ind] for trials, ind in zip(Y_att_trans_trials_tasks, indices)]
+        Y_compete_trans_trials_tasks = [[trials[i] for i in ind] for trials, ind in zip(Y_compete_trans_trials_tasks, indices)]
+        corr_att_trials = np.stack(corr_att_trials_tasks, axis=2)
+        corr_compete_trials = np.stack(corr_compete_trials_tasks, axis=2)
+        X_trans_trials = [np.stack([task_trials[i] for task_trials in X_trans_trials_tasks], axis=2) for i in range(min_nb_trials)]
+        Y_att_trans_trials = [np.stack([task_trials[i] for task_trials in Y_att_trans_trials_tasks], axis=2) for i in range(min_nb_trials)]
+        Y_compete_trans_trials = [np.stack([task_trials[i] for task_trials in Y_compete_trans_trials_tasks], axis=2) for i in range(min_nb_trials)]
+        rts_kept = np.array(rts_kept).reshape(1, -1)
+        return corr_att_trials, corr_compete_trials, X_trans_trials, Y_att_trans_trials, Y_compete_trans_trials, rts_kept
 
     def permutation_test(self, X, Y, V_A, V_B, nb_permu=200, PHASE_SCRAMBLE=False, block_len=1, X_trans=None, Y_trans=None):
         '''
@@ -251,29 +297,6 @@ class CanonicalCorrelationAnalysis:
             acc, _, _, _, _= utils.eval_compete_3D(corr_X1_trials, corr_X2_trials, TRAIN_WITH_ATT=True, message=False)
             acc_list.append(acc)
         return acc_list
-
-    # def forward_model(self, X, V_A, X_trans=None):
-    #     '''
-    #     Inputs:
-    #     X: observations (one subject) TxD
-    #     V_A: filters/backward models DLxK
-    #     X_trans: transformed TxK
-    #     (Do not consider REGFEATS here)
-    #     Output:
-    #     F: forward model
-    #     '''
-    #     if X_trans is not None: 
-    #         # Calculate the forward model based on the original data
-    #         F = (lstsq(X_trans, X)[0]).T
-    #     else: 
-    #         # Calculate the forward model based on the Hankelized data and extract the forward model corresponding to the correct time points
-    #         X_block_Hankel = utils.block_Hankel(X, self.L_EEG, self.offset_EEG)
-    #         Rxx = np.cov(X_block_Hankel, rowvar=False)
-    #         if np.ndim(Rxx) == 0:
-    #             Rxx = np.array([[Rxx]])
-    #         F_redun = Rxx@V_A@LA.inv(V_A.T@Rxx@V_A)
-    #         F = utils.F_organize(F_redun, self.L_EEG, self.offset_EEG)
-    #     return F
 
     def get_train_test_data(self):
         train_list_folds, test_list_folds = utils.split_multi_mod_LVO([self.EEG_list, self.Stim_list], self.leave_out)
@@ -335,14 +358,11 @@ class CanonicalCorrelationAnalysis:
                 V_eeg_train, V_feat_train = V_eeg, V_Stim
             if not self.MASK:
                 corr_match_eeg_i, corr_mismatch_eeg_i, start_points, X_trans_trials, Y_att_trans_trials, Y_compete_trans_trials = self.cal_corr_compete_trials(EEG_test, Sti_test, V_eeg_train, V_feat_train, BOOTSTRAP, trial_len, given_start_points=start_points, overlap=overlap) 
-                X_all_trials = X_trans_trials + X_all_trials
-                Y_att_all_trials = Y_att_trans_trials + Y_att_all_trials
-                Y_compete_all_trials = Y_compete_trans_trials + Y_compete_all_trials
             else:
-                corr_match_eeg_i, corr_mismatch_eeg_i, start_points, X_trials, Y_att_trials, Y_compete_trials, rts = self.cal_corr_compete_trials_mask(EEG_test, Sti_test, V_eeg_train, V_feat_train, BOOTSTRAP, trial_len, given_start_points=start_points, overlap=overlap) 
-                X_all_trials = X_trials + X_all_trials
-                Y_att_all_trials = Y_att_trials + Y_att_all_trials
-                Y_compete_all_trials = Y_compete_trials + Y_compete_all_trials
+                corr_match_eeg_i, corr_mismatch_eeg_i, X_trans_trials, Y_att_trans_trials, Y_compete_trans_trials, rts = self.cal_corr_compete_mask_trials(EEG_test, Sti_test, V_eeg_train, V_feat_train, BOOTSTRAP, trial_len, overlap=overlap) 
+            X_all_trials = X_trans_trials + X_all_trials
+            Y_att_all_trials = Y_att_trans_trials + Y_att_all_trials
+            Y_compete_all_trials = Y_compete_trans_trials + Y_compete_all_trials
             corr_match_eeg.append(corr_match_eeg_i)
             corr_mismatch_eeg.append(corr_mismatch_eeg_i)
             if self.MASK:
@@ -352,7 +372,7 @@ class CanonicalCorrelationAnalysis:
         if self.MASK:
             rts_kept = np.concatenate(tuple(rts_kept), axis=0)
         if PERMU_TEST:
-            acc_permu_list = self.permutation_test_acc(X_all_trials, Y_att_all_trials, Y_compete_all_trials) if not self.MASK else self.permutation_test_acc(X_all_trials, Y_att_all_trials, Y_compete_all_trials, V_X=V_eeg_train, V_Y=V_feat_train)
+            acc_permu_list = self.permutation_test_acc(X_all_trials, Y_att_all_trials, Y_compete_all_trials)
         else:
             acc_permu_list = None
         return corr_match_eeg, corr_mismatch_eeg, acc_permu_list, start_points, rts_kept

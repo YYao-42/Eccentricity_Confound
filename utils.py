@@ -366,7 +366,7 @@ def select_distractors(data_list, fs, t, start_point):
 
 def shift_trials(data_trials, shift=None):
     '''
-    Given a list of trials, move half of the trials to the end of the list
+    Given a list of trials, move part of the trials to the end of the list
     '''
     nb_trials = len(data_trials)
     if shift is None:
