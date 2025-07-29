@@ -174,10 +174,8 @@ class CanonicalCorrelationAnalysis:
             rts_of_not_nan = np.mean(rts_of_not_nan, axis=0)
         return corr_coe, rts_of_not_nan
 
-    def cal_corr_compete_trials(self, X, Y_att, V_X, V_Y, BOOTSTRAP, trial_len, given_start_points=None, BTfactor=2, overlap=0.9):
-        X_trans, Y_att_trans, _ = self.get_transformed_data(X, Y_att, V_X, V_Y) if np.ndim(X) == 2 else self.get_transformed_data_3D(X, Y_att, V_X, V_Y)
-        T = X_trans.shape[0]
-        assert T-trial_len*self.fs >= 0, "The trial length is too long."
+    def get_start_points(self, T, trial_len, BOOTSTRAP, BTfactor=2, overlap=0.9, given_start_points=None):
+        assert T-trial_len*self.fs >= 0, f"The trial length is too long. T: {T}, trial_len*fs: {trial_len*self.fs}"
         if given_start_points is None:
             if BOOTSTRAP:
                 nb_trials = min(T//self.fs//BTfactor, 200)
@@ -187,6 +185,13 @@ class CanonicalCorrelationAnalysis:
                 start_points = np.array(range(0, T - T%(self.fs*trial_len), round(self.fs*trial_len*(1-overlap))))
         else:
             start_points = given_start_points
+        return start_points
+
+    def cal_corr_compete_trials(self, X, Y_att, V_X, V_Y, BOOTSTRAP, trial_len, given_start_points=None, BTfactor=2, overlap=0.9):
+        X_trans, Y_att_trans, _ = self.get_transformed_data(X, Y_att, V_X, V_Y) if np.ndim(X) == 2 else self.get_transformed_data_3D(X, Y_att, V_X, V_Y)
+        T = X_trans.shape[0]
+        assert T-trial_len*self.fs >= 0, "The trial length is too long."
+        start_points = self.get_start_points(T, trial_len, BOOTSTRAP, BTfactor, overlap, given_start_points)
         # Note: the data has been transformed
         X_trans_trials = utils.into_trials(X_trans, self.fs, trial_len, start_points=start_points)
         Y_att_trans_trials = utils.into_trials(Y_att_trans, self.fs, trial_len, start_points=start_points)
@@ -200,15 +205,7 @@ class CanonicalCorrelationAnalysis:
         '''First divide data into trials and then apply the mask before calculating the correlation coefficients.'''
         T = X.shape[0]
         assert T-trial_len*self.fs >= 0, "The trial length is too long."
-        if given_start_points is None:
-            if BOOTSTRAP:
-                nb_trials = min(T//self.fs//BTfactor, 200)
-                start_points = np.random.randint(0, T-trial_len*self.fs, size=nb_trials)
-                start_points = np.sort(start_points)
-            else:
-                start_points = np.array(range(0, T - T%(self.fs*trial_len), round(self.fs*trial_len*(1-overlap))))
-        else:
-            start_points = given_start_points
+        start_points = self.get_start_points(T, trial_len, BOOTSTRAP, BTfactor, overlap, given_start_points)
         # Note: the data has not been transformed
         X_trials = utils.into_trials(X, self.fs, trial_len, start_points=start_points)
         Y_att_trials = utils.into_trials(Y_att, self.fs, trial_len, start_points=start_points)
@@ -230,13 +227,7 @@ class CanonicalCorrelationAnalysis:
             X_trans, Y_trans, rt_of_not_nan = self.get_transformed_data(X[:,:,task], Y_att[:,:,task], V_X, V_Y)
             rts_kept.append(rt_of_not_nan)
             T = X_trans.shape[0]
-            assert T-trial_len*self.fs >= 0, "The trial length is too long."
-            if BOOTSTRAP:
-                nb_trials = min(T//self.fs//BTfactor, 200)
-                start_points = np.random.randint(0, T-trial_len*self.fs, size=nb_trials)
-                start_points = np.sort(start_points)
-            else:
-                start_points = np.array(range(0, T - T%(self.fs*trial_len), round(self.fs*trial_len*(1-overlap))))
+            start_points = self.get_start_points(T, trial_len, BOOTSTRAP, BTfactor, overlap)
             X_trans_trials = utils.into_trials(X_trans, self.fs, trial_len, start_points=start_points)
             Y_att_trans_trials = utils.into_trials(Y_trans, self.fs, trial_len, start_points=start_points)
             Y_compete_trans_trials = utils.shift_trials(Y_att_trans_trials)
@@ -377,12 +368,50 @@ class CanonicalCorrelationAnalysis:
             acc_permu_list = None
         return corr_match_eeg, corr_mismatch_eeg, acc_permu_list, start_points, rts_kept
 
+    def mm_blocks(self, trial_len, BOOTSTRAP=True, overlap=0.9, block_len=90, block_ol=0.8):
+        '''
+        Match-Mismatch task with leave-one-pair-out
+        Always train on match and try to distinguish match from mismatch 
+        Mismatch is a random segment that is not shown on the screen
+        '''
+        train_list_folds, test_list_folds, _ = self.get_train_test_data()
+        corr_match_dict = {}
+        corr_mismatch_dict = {}
+        rts_kept_dict = {}
+        for idx in range(0, self.nb_folds):
+            [EEG_train, Sti_train], [EEG_test, Sti_test] = train_list_folds[idx], test_list_folds[idx]
+            _, V_eeg_train, V_feat_train, _ = self.fit(EEG_train, Sti_train)
+            block_start_points = self.get_start_points(EEG_test.shape[0], block_len, BOOTSTRAP=False, overlap=block_ol)
+            EEG_blocks = utils.into_trials(EEG_test, self.fs, block_len, start_points=block_start_points)
+            Sti_blocks = utils.into_trials(Sti_test, self.fs, block_len, start_points=block_start_points)
+            for i, (eeg, sti) in enumerate(zip(EEG_blocks, Sti_blocks)):
+                if not self.MASK:
+                    try:
+                        corr_match_eeg_i, corr_mismatch_eeg_i, _, _, _, _ = self.cal_corr_compete_trials(eeg, sti, V_eeg_train, V_feat_train, BOOTSTRAP, trial_len, overlap=overlap) 
+                    except:
+                        continue
+                else:
+                    try:
+                        corr_match_eeg_i, corr_mismatch_eeg_i, _, _, _, rts_i = self.cal_corr_compete_mask_trials(eeg, sti, V_eeg_train, V_feat_train, BOOTSTRAP, trial_len, overlap=overlap) 
+                    except:
+                        continue
+                if i not in corr_match_dict:
+                    corr_match_dict[i] = corr_match_eeg_i
+                    corr_mismatch_dict[i] = corr_mismatch_eeg_i
+                    rts_kept_dict[i] = rts_i if self.MASK else None
+                else:
+                    corr_match_dict[i] = np.concatenate((corr_match_dict[i], corr_match_eeg_i), axis=0)
+                    corr_mismatch_dict[i] = np.concatenate((corr_mismatch_dict[i], corr_mismatch_eeg_i), axis=0)
+                    if self.MASK:
+                        rts_kept_dict[i] = np.concatenate((rts_kept_dict[i], rts_i), axis=0)
+        return corr_match_dict, corr_mismatch_dict, rts_kept_dict
+
 
 class GeneralizedCCA:
     '''
     Perform GCCA on data of different subjects. If subjects have multi-modal data, then the data are concatenated along the channel axis.
     '''
-    def __init__(self, EEG_list, fs, L, offset, hankelized=False, dim_list=None, task_train=[2,3], leave_out=1, n_components=5, regularization='lwcov', message=True, signifi_level=True, n_permu=500, p_value=0.05, save_W_perfold=False):
+    def __init__(self, EEG_list, fs, L, offset, hankelized=False, dim_list=None, task_train=[2,3], leave_out=1, n_components=5, regularization='lwcov', message=True, signifi_level=True, n_permu=500, p_value=0.05, save_W_perfold=False, EEG_list_masked=None):
         '''
         EEG_list: list of EEG data, each element is a T(#sample)xDx(#channel)xN(#subj)x(#task) array corresponding to a video 
         fs: Sampling rate
@@ -421,9 +450,15 @@ class GeneralizedCCA:
         self.nb_videos = len(self.EEG_list)
         assert self.nb_videos%self.leave_out == 0, "The number of videos should be a multiple of the leave_out parameter."
         self.nb_folds = self.nb_videos//self.leave_out
+        self.EEG_list_masked = EEG_list_masked
 
-    def get_train_test_data(self):
-        train_list_folds, test_list_folds = utils.split_multi_mod_LVO([self.EEG_list], self.leave_out)
+    def apply_mask(self, X):
+        idx_not_nan = ~np.isnan(X).any(axis=1)
+        X = X[idx_not_nan, :]
+        return X
+
+    def get_train_test_data(self, MASKED=False):
+        train_list_folds, test_list_folds = utils.split_multi_mod_LVO([self.EEG_list], self.leave_out) if not MASKED else utils.split_multi_mod_LVO([self.EEG_list_masked], self.leave_out)
         T, _, N, nb_tasks = train_list_folds[0][0].shape
         assert len(train_list_folds) == len(test_list_folds) == self.nb_folds, "The number of folds is not correct."
         train_list_folds = [[np.concatenate(tuple([data[0][:,:,:,t] for t in self.task_train]), axis=0)] for data in train_list_folds]
@@ -446,6 +481,7 @@ class GeneralizedCCA:
         # each column represents a variable, while the rows contain observations
         X_list = [utils.block_Hankel(X_stack[:,:,n], L, self.offset) for n in range(N)]
         X = np.concatenate(tuple(X_list), axis=1)
+        X = self.apply_mask(X) # remove rows with NaN
         X_center = X - np.mean(X, axis=0, keepdims=True)
         Rxx, _ = utils.get_cov_mtx(X, dim_list_extended, self.regularization)
         Dxx = np.zeros_like(Rxx)
@@ -470,6 +506,7 @@ class GeneralizedCCA:
     def fit_corrca(self, X_stack):
         T, _, N = X_stack.shape
         X_list = [utils.block_Hankel(X_stack[:,:,n], self.L, self.offset) for n in range(N)]
+        X_list = [self.apply_mask(X) for X in X_list] # remove rows with NaN
         X = np.stack(X_list, axis=2)
         X_center = X - np.mean(X, axis=0, keepdims=True)
         _, D, _ = X.shape
@@ -505,7 +542,7 @@ class GeneralizedCCA:
         if np.ndim (W_stack) == 2: # for correlated component analysis
             W_stack = np.expand_dims(W_stack, axis=1)
             W_stack = np.repeat(W_stack, N, axis=1)
-        Hankellist = [np.expand_dims(utils.block_Hankel(X_stack[:,:,n], self.L, self.offset), axis=2) for n in range(N)]
+        Hankellist = [np.expand_dims(self.apply_mask(utils.block_Hankel(X_stack[:,:,n], self.L, self.offset)), axis=2) for n in range(N)]
         Hankel_center = [hankel - np.mean(hankel, axis=0, keepdims=True) for hankel in Hankellist]
         X_center = np.concatenate(tuple(Hankel_center), axis=2)
         X_trans = np.einsum('tdn,dkn->tkn', X_center, np.transpose(W_stack, (0,2,1)))
@@ -547,6 +584,14 @@ class GeneralizedCCA:
         avg_corr = np.stack(corr_all, axis=1) # (n_components, nb_tasks)
         return avg_corr
 
+    def cal_avg_corr_coe_trials(self, X_trials, W_stack=None, avg=True):
+        Four_D = np.ndim(X_trials[0]) == 4
+        corr_coe_trials = [self.cal_avg_corr_coe(X, W_stack) for X in X_trials] if not Four_D else [self.cal_avg_corr_coe_4D(X, W_stack) for X in X_trials]
+        corr_coe = np.stack(corr_coe_trials, axis=0)
+        if avg:
+            corr_coe = np.mean(corr_coe, axis=0)
+        return corr_coe
+
     def permutation_test(self, X_stack, W_stack, PHASE_SCRAMBLE=True, block_len=None):
         corr_coe_topK = np.empty((0, self.n_components))
         X_trans = self.get_transformed_data(X_stack, W_stack)
@@ -564,6 +609,8 @@ class GeneralizedCCA:
     
     def cross_val(self, CORRCA=True):
         train_list_folds, test_list_folds, nb_tasks = self.get_train_test_data()
+        if self.EEG_list_masked is not None:
+            _, test_list_folds, _ = self.get_train_test_data(MASKED=True)
         n_components = self.n_components
         nb_folds = self.nb_folds
         corr_train_fold = np.zeros((nb_folds, n_components))
@@ -571,7 +618,7 @@ class GeneralizedCCA:
         corr_permu_fold = []
         for idx in range(0, nb_folds):
             [EEG_train], [EEG_test] = train_list_folds[idx], test_list_folds[idx]
-            W_train, _, _, _ = self.fit(EEG_train) if not CORRCA else self.fit_corrca(EEG_train)
+            W_train, _, F, _ = self.fit(EEG_train) if not CORRCA else self.fit_corrca(EEG_train)
             corr_train_fold[idx,:] = self.cal_avg_corr_coe(EEG_train, W_train)
             corr_test_fold[idx,:,:] = self.cal_avg_corr_coe_4D(EEG_test, W_train)
             if self.signifi_level:
@@ -587,8 +634,36 @@ class GeneralizedCCA:
             print('Average ISC of the top {} components on the training sets: {}'.format(n_components, np.average(corr_train_fold, axis=0)))
             print('Average ISC of the top {} components on the test sets: {}'.format(n_components, np.average(corr_test_fold, axis=0)))
             print('Significance level: {}'.format(sig_corr_pool))
-        return corr_train_fold, corr_test_fold, sig_corr_fold, sig_corr_pool
-
+        return corr_train_fold, corr_test_fold, sig_corr_fold, sig_corr_pool, F
+    
+    def cross_val_trials(self, BOOTSTRAP, trial_len, given_start_points=None, BTfactor=2, overlap=0.9, CORRCA=True):
+        train_list_folds, test_list_folds, nb_tasks = self.get_train_test_data()
+        if self.EEG_list_masked is not None:
+            _, test_list_folds, _ = self.get_train_test_data(MASKED=True)
+        n_components = self.n_components
+        nb_folds = self.nb_folds
+        corr_test_folds = []
+        for idx in range(0, nb_folds):
+            [EEG_train], [EEG_test] = train_list_folds[idx], test_list_folds[idx]
+            W_train, _, F, _ = self.fit(EEG_train) if not CORRCA else self.fit_corrca(EEG_train)
+            T = EEG_test.shape[0]
+            assert T-trial_len*self.fs >= 0, "The trial length is too long."
+            if given_start_points is None:
+                if BOOTSTRAP:
+                    nb_trials = min(T//self.fs//BTfactor, 200)
+                    start_points = np.random.randint(0, T-trial_len*self.fs, size=nb_trials)
+                    start_points = np.sort(start_points)
+                else:
+                    start_points = np.array(range(0, T - T%(self.fs*trial_len), round(self.fs*trial_len*(1-overlap))))
+            else:
+                start_points = given_start_points
+            EEG_trials = utils.into_trials(EEG_test, self.fs, trial_len, start_points=start_points)
+            corr_trials = self.cal_avg_corr_coe_trials(EEG_trials, W_train, avg=False)
+            corr_test_folds.append(corr_trials)
+        if self.message:
+            print('Average ISC of the top {} components on the test sets: {}'.format(n_components, np.average(np.concatenate(corr_test_folds, axis=0), axis=0)))
+        return corr_test_folds, start_points, F
+    
     def get_enhanced_data(self, CORRCA=True):
         assert self.leave_out == 1, "This function only works for leave-one-pair-out cross-validation."
         train_list_folds, test_list_folds, nb_tasks = self.get_train_test_data()
