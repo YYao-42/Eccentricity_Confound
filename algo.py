@@ -11,7 +11,7 @@ import random
 from sklearn.covariance import LedoitWolf
 from tqdm import tqdm
 from numpy import linalg as LA
-from scipy.linalg import eig, eigh, sqrtm, lstsq
+from scipy.linalg import eig, eigh, sqrtm, lstsq, block_diag
 from scipy.stats import pearsonr
 import utils
 
@@ -607,6 +607,13 @@ class GeneralizedCCA:
         corr_trials = np.sort(abs(corr_trials), axis=None)
         return corr_trials[sig_idx]
     
+    def calculate_sig_multi_comp(self, corr_trials, nb_fold=1, nb_components=2):
+        corr_agg = np.sum(corr_trials[:,:nb_components], axis=1)
+        corr_agg = np.sort(abs(corr_agg), axis=None)
+        assert self.n_permu*nb_fold == corr_agg.shape[0]
+        sig_idx = -int(self.n_permu*self.p_value*nb_fold)
+        return corr_agg[sig_idx]
+    
     def cross_val(self, CORRCA=True):
         train_list_folds, test_list_folds, nb_tasks = self.get_train_test_data()
         if self.EEG_list_masked is not None:
@@ -624,16 +631,16 @@ class GeneralizedCCA:
             if self.signifi_level:
                 corr_permu_fold.append(self.permutation_test(EEG_test[:,:,:,0], W_train))
         if self.signifi_level:
-            sig_corr_fold = [self.calculate_sig_corr(corr_permu) for corr_permu in corr_permu_fold]
+            sig_corr_fold = [self.calculate_sig_multi_comp(corr_permu) for corr_permu in corr_permu_fold]
             corr_permu_all = np.concatenate(tuple(corr_permu_fold), axis=0)
-            sig_corr_pool = self.calculate_sig_corr(corr_permu_all, nb_fold=nb_folds)
+            sig_corr_pool = self.calculate_sig_multi_comp(corr_permu_all, nb_fold=nb_folds)
         else:
             sig_corr_fold = None
             sig_corr_pool = None
         if self.message:
             print('Average ISC of the top {} components on the training sets: {}'.format(n_components, np.average(corr_train_fold, axis=0)))
             print('Average ISC of the top {} components on the test sets: {}'.format(n_components, np.average(corr_test_fold, axis=0)))
-            print('Significance level: {}'.format(sig_corr_pool))
+            print('Significance level (CC1+CC2): {}'.format(sig_corr_pool))
         return corr_train_fold, corr_test_fold, sig_corr_fold, sig_corr_pool, F
     
     def cross_val_trials(self, BOOTSTRAP, trial_len, given_start_points=None, BTfactor=2, overlap=0.9, CORRCA=True):
@@ -679,3 +686,142 @@ class GeneralizedCCA:
         return enhanced_list
 
 
+class BlockCCA:
+    def __init__(self, list_X, list_Y, fs, L, offset, sharefilter='set', hankelized=False, leave_out=1, n_components=5, regularization='lwcov', message=True, signifi_level=True, n_permu=500, p_value=0.05, save_W_perfold=False):
+        '''
+        list_X, list_Y: lists of data, each element is a T(#sample)xDx(#channel)xN(#subj) array corresponding to a video 
+        fs: Sampling rate
+        L: If use (spatial-) temporal filter, the number of taps
+        offset: If use (spatial-) temporal filter, the offset of the time lags
+        sharefilter: Share filters for the views in each set if 'set'; Share filters for all views if 'all'; Do not share filters if 'none'
+        hankelized: If the data is already hankelized because of regression
+        leave_out: Number of pairs to leave out for leave-one-pair-out cross-validation
+        n_components: Number of components to be returned
+        regularization: Regularization of the estimated covariance matrix
+        message: If print message
+        signifi_level: If calculate significance level
+        n_permu: Number of permutations for significance level calculation
+        p_value: P-value for significance level calculation
+        save_W_perfold: If save the weights per fold
+        '''
+        self.list_X = list_X
+        self.list_Y = list_Y
+        self.fs = fs
+        self.L = L
+        self.offset = offset
+        self.sharefilter = sharefilter
+        self.hankelized = hankelized
+        self.leave_out = leave_out
+        self.n_components = n_components
+        self.regularization = regularization
+        self.message = message
+        self.signifi_level = signifi_level
+        self.n_permu = n_permu
+        self.p_value = p_value
+        self.save_W_perfold = save_W_perfold
+        if self.save_W_perfold:
+            self.test_list = []
+            self.W_train_list = []
+
+    def hankelize_data(self, X_stack, concat=True, center=True):
+        _, _, N = X_stack.shape
+        if not self.hankelized:
+            X_stack = utils.hankelize_data_multisub(X_stack, self.L, self.offset)
+        dim_list = [X_stack.shape[1]]*N
+        if concat:
+            X_stack = np.concatenate(tuple([X_stack[:,:,n] for n in range(N)]), axis=1)
+        if center:
+            X_stack = X_stack - np.mean(X_stack, axis=0, keepdims=True)
+        return X_stack, dim_list
+
+    def fit(self, X_stack, Y_stack):
+        Nx = X_stack.shape[2]
+        Ny = Y_stack.shape[2]
+        X_center, dim_list_X = self.hankelize_data(X_stack)
+        Y_center, dim_list_Y = self.hankelize_data(Y_stack)
+        agg = np.concatenate((X_center, Y_center), axis=1)
+        dim_list = dim_list_X + dim_list_Y
+        R, D = utils.get_cov_mtx(agg, dim_list, self.regularization)
+        dimX = sum(dim_list_X)
+        # R[:dimX, :dimX] = np.diag(np.diag(R[:dimX, :dimX]))
+        R[:dimX, :dimX] = 0
+        R[dimX:, dimX:] = 0
+        R = R + D
+        if self.sharefilter == 'set':
+            Ix = [np.eye(d) for d in dim_list_X]
+            Ix = np.concatenate(tuple(Ix), axis=0)
+            Iy = [np.eye(d) for d in dim_list_Y]
+            Iy = np.concatenate(tuple(Iy), axis=0)
+            I = block_diag(Ix, Iy)
+            R = I.T @ R @ I
+            D = I.T @ D @ I
+            dim_list = [Ix.shape[1], Iy.shape[1]]
+        elif self.sharefilter == 'all':
+            I = [np.eye(d) for d in dim_list]
+            I = np.concatenate(tuple(I), axis=0)
+            R = I.T @ R @ I
+            D = I.T @ D @ I
+            dim_list = [I.shape[1]]
+        elif self.sharefilter == 'none':
+            pass
+        else:
+            raise ValueError("Invalid value for sharefilter. Choose from 'set', 'all', or 'none'.")
+        # _, W = eigh(D, R, subset_by_index=[0,self.n_components-1]) # automatically ascending
+        _, W = eigh(R, D, subset_by_index=[D.shape[0]-self.n_components, D.shape[0]-1])
+        W = np.fliplr(W) # descending order
+        # divide W based on dim_list
+        W_list = np.vsplit(W, np.cumsum(dim_list)[:-1])
+        if len(W_list) == 2:
+            assert self.sharefilter == 'set', "If there are only two views, then sharefilter should be 'set'."
+            W_list = [W_list[0]] * Nx + [W_list[1]] * Ny
+        elif len(W_list) == 1:
+            assert self.sharefilter == 'all', "If there is only one view, then sharefilter should be 'all'."
+            W_list = [W_list[0]] * (Nx + Ny)
+        else:
+            assert len(W_list) == Nx + Ny, "The number of views does not match for mode 'none'."
+        W = np.stack(W_list, axis=2) # (D_total, n_components, N_total)
+        return W
+    
+    def get_transformed_data(self, X_stack, Y_stack, W):
+        X_stack_center, _ = self.hankelize_data(X_stack, concat=False)
+        Y_stack_center, _ = self.hankelize_data(Y_stack, concat=False)
+        Nx = X_stack_center.shape[2]
+        Ny = Y_stack_center.shape[2]
+        assert W.shape[2] == Nx + Ny, "The number of views does not match."
+        Wx = W[:,:,:Nx]
+        Wy = W[:,:,Nx:]
+        X_trans = np.einsum('tdn,dkn->tkn', X_stack_center, Wx)
+        Y_trans = np.einsum('tdn,dkn->tkn', Y_stack_center, Wy)
+        return X_trans, Y_trans
+
+    def cal_avg_corr_coe(self, X_stack, Y_stack, W_stack=None):
+        '''
+        Calculate the inter-subject correlation (average pairwise correlation)
+        '''
+        if W_stack is None:
+            X_trans, Y_trans = X_stack, Y_stack
+        else:
+            X_trans, Y_trans = self.get_transformed_data(X_stack, Y_stack, W_stack)
+        Nx = X_trans.shape[2]
+        Ny = Y_trans.shape[2]
+        n_components = self.n_components
+        corr_tensor = np.zeros((Nx + Ny, Nx + Ny, n_components))
+        for component in range(n_components):
+            agg_trans = np.hstack((X_trans[:,component,:], Y_trans[:,component,:]))
+            corr_tensor[:,:,component] = np.corrcoef(agg_trans, rowvar=False)
+        # cross_corr_tensor = corr_tensor[Nx:, :Nx, :]
+        # avg_corr = np.mean(cross_corr_tensor, axis=(0,1))
+        return corr_tensor
+    
+    def cross_val(self):
+        train_list_folds, test_list_folds = utils.split_multi_mod_LVO([self.list_X, self.list_Y], self.leave_out)
+        n_components = self.n_components
+        nb_folds = len(train_list_folds)
+        corr_train_folds = []
+        corr_test_folds = []
+        for idx in range(0, nb_folds):
+            [setA_train, setB_train], [setA_test, setB_test] = train_list_folds[idx], test_list_folds[idx]
+            W_train = self.fit(setA_train, setB_train)
+            corr_train_folds.append(self.cal_avg_corr_coe(setA_train, setB_train, W_train))
+            corr_test_folds.append(self.cal_avg_corr_coe(setA_test, setB_test, W_train))
+        return corr_train_folds, corr_test_folds
