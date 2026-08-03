@@ -4,6 +4,7 @@ import mne
 import scipy.io
 import matplotlib.pyplot as plt
 import copy
+import math
 import pickle
 import os
 import pandas as pd
@@ -12,7 +13,7 @@ from numpy import linalg as LA
 from scipy import signal
 from scipy.linalg import toeplitz, eig, eigh, sqrtm, lstsq
 from scipy.sparse.linalg import eigs
-from scipy.stats import zscore, pearsonr, binomtest, binom
+from scipy.stats import zscore, pearsonr, binomtest, binom, wilcoxon, mannwhitneyu, rankdata
 from sklearn.covariance import LedoitWolf
 from collections import Counter
 from sklearn.cluster import DBSCAN
@@ -121,6 +122,18 @@ def regress_out(X, Y):
         X_res = X - Y @ W
     else:
         raise ValueError('Check the dimension of X')
+    return X_res
+
+
+def regress_out_4D(X, Y):
+    '''
+    Regress out Y from X
+    X: T x Dx x N x nb_tasks
+    Y: T x Dy x nb_tasks,
+    '''
+    X_res = copy.deepcopy(X)
+    for i in range(X.shape[-1]):
+        X_res[:,:,:,i] = regress_out(X[:,:,:,i], Y[:,:,i])
     return X_res
 
 
@@ -303,8 +316,7 @@ def block_Hankel(X, L, offset=0):
 def hankelize_data_multisub(data_multisub, L, offset):
     N = data_multisub.shape[2]
     X_list = [block_Hankel(data_multisub[:,:,n], L, offset) for n in range(N)]
-    X_list = [np.expand_dims(X, axis=2) for X in X_list]
-    X = np.concatenate(tuple(X_list), axis=2)
+    X = np.stack(X_list, axis=2)
     return X
 
 
@@ -351,19 +363,6 @@ def into_trials(data, fs, t=60, start_points=None):
     return data_trials
 
 
-def select_distractors(data_list, fs, t, start_point):
-    assert all(data.shape[0] == data_list[0].shape[0] for data in data_list)
-    data_list = [np.expand_dims(data, axis=1) if np.ndim(data)==1 else data for data in data_list]
-    adjacent_start = max(start_point - fs, 0)
-    adjacent_end = min(start_point + (t+1)*fs, data_list[0].shape[0])
-    # remove the target trial from the data
-    data_distractor_list = [np.delete(data, range(adjacent_start, adjacent_end), axis=0) for data in data_list]
-    # randomly select one trial from the rest of the data
-    start_points_distractor = np.random.randint(0, len(data_distractor_list[0])-t*fs, size=1)[0]
-    seg_distractor_list = [data_distractor[start_points_distractor:start_points_distractor+t*fs, ...] for data_distractor in data_distractor_list]
-    return seg_distractor_list
-
-
 def shift_trials(data_trials, shift=None):
     '''
     Given a list of trials, move part of the trials to the end of the list
@@ -373,6 +372,32 @@ def shift_trials(data_trials, shift=None):
         shift = nb_trials//3
     trials_shifted = [data_trials[(n+shift)%nb_trials] for n in range(nb_trials)]
     return trials_shifted
+
+
+def select_mismatches(data_trials, nb_mismatch):
+    '''
+    Given a list of trials, select nb_mismatch mismatched trials for each trial
+    '''
+    nb_trials = len(data_trials)
+    match_indices_list = []
+    mismatch_indices_list = []
+    for i in range(nb_trials):
+        possible_indices = [j for j in range(nb_trials) if j != i] if nb_trials > 1 else [0]
+        if nb_mismatch > len(possible_indices):
+            nb_mismatch = len(possible_indices)
+        mismatch_indices = random.sample(possible_indices, nb_mismatch)
+        match_indices = [i]*nb_mismatch
+        mismatch_indices_list.extend(mismatch_indices)
+        match_indices_list.extend(match_indices)
+    return mismatch_indices_list, match_indices_list
+
+
+def match_mismatch_pairs(X_trials, Y_trials, nb_mismatch):
+    mismatch_indices_list, match_indices_list = select_mismatches(Y_trials, nb_mismatch)
+    matches_X = [X_trials[i] for i in match_indices_list]
+    matches_Y = [Y_trials[i] for i in match_indices_list]
+    mismatches_Y = [Y_trials[i] for i in mismatch_indices_list]
+    return matches_X, matches_Y, mismatches_Y
 
 
 def split_multi_mod_LVO(nested_datalist, leave_out=2):
@@ -391,6 +416,61 @@ def split_multi_mod_LVO(nested_datalist, leave_out=2):
         train_list_folds.append([np.concatenate(tuple([mod[i] for i in indices_train]), axis=0) if mod is not None else None for mod in nested_datalist])
         test_list_folds.append([np.concatenate(tuple([mod[i] for i in indices_test]), axis=0) if mod is not None else None for mod in nested_datalist])
     return train_list_folds, test_list_folds
+
+
+def wilcoxon_effect(a, b, zero_method="wilcox", alternative="greater"):
+    """Paired Wilcoxon signed-rank: Z, p, and matched-pairs rank-biserial r.
+
+    a, b : 1D arrays of paired measurements (e.g. per-subject accuracies
+            in Task 3 and Task 2). 
+    """
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    d = a - b
+    d = d[d != 0]                       # drop zero differences (Wilcoxon default)
+    n = d.size                          # number of non-zero pairs
+    r_abs = rankdata(np.abs(d))
+    W_plus = r_abs[d > 0].sum()
+    W_minus = r_abs[d < 0].sum()
+
+    # rank-biserial from the signed-rank sums (definitional form)
+    rb = (W_plus - W_minus) / (W_plus + W_minus)
+
+    # Z and two-sided p from the normal approximation (tie/continuity corrected)
+    res = wilcoxon(a, b, method="approx", zero_method=zero_method, alternative=alternative)
+    z, p = res.zstatistic, res.pvalue
+    r_from_z = z / np.sqrt(n)           # should match rb up to sign/tie handling
+
+    return dict(n=n, W_plus=W_plus, W_minus=W_minus,
+                z=z, p=p, rank_biserial=rb, r_from_z=r_from_z)
+
+
+def mwu_effect(x, y, continuity=True, alternative="two-sided"):
+    """Independent Mann-Whitney U: U, Z, p, rank-biserial r, and CLES.
+
+    x, y : 1D arrays for the two groups (e.g. x = free-viewing, y = fixation).
+    Sign convention: positive r / CLES > 0.5 means x tends to exceed y.
+    """
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    n1, n2 = x.size, y.size
+
+    res = mannwhitneyu(x, y, alternative=alternative)
+    U1, p = res.statistic, res.pvalue          # U for the first group (x)
+
+    rb = 2 * U1 / (n1 * n2) - 1                 # independent rank-biserial
+    cles = U1 / (n1 * n2)                       # P(x > y), common-language ES
+
+    # Z from the normal approximation with tie correction
+    N = n1 + n2
+    ranks = rankdata(np.concatenate([x, y]))
+    _, counts = np.unique(ranks, return_counts=True)
+    tie = (counts**3 - counts).sum()
+    mu = n1 * n2 / 2.0
+    sigma = np.sqrt((n1 * n2 / 12.0) * ((N + 1) - tie / (N * (N - 1))))
+    cc = 0.5 if continuity else 0.0
+    z = (U1 - mu - np.sign(U1 - mu) * cc) / sigma
+
+    return dict(n1=n1, n2=n2, U=U1, z=z, p=p,
+                rank_biserial=rb, cles=cles, r_from_z=z / np.sqrt(N))
 
 
 def sig_level_binomial_test(p_value, total_trials, p=0.5):
@@ -515,6 +595,16 @@ def F_organize(F_redun, L, offset, avg=True):
     return F
 
 
+def F_avg_temporal(F_redun, L):
+    DL, K = F_redun.shape
+    D = int(DL/L)
+    F_avg = np.zeros((D, K))
+    F_blocks = np.split(F_redun, D, axis=0)
+    for i in range(D):
+        F_avg[i,:] = np.mean(F_blocks[i], axis=0)
+    return F_avg
+
+
 def forward_model(X, W_Hankel, L=1, offset=0):
     '''
     Reference: On the interpretation of weight vectors of linear models in multivariate neuroimaging https://www.sciencedirect.com/science/article/pii/S1053811913010914
@@ -629,6 +719,18 @@ def shuffle_datalist(datalist, block_len):
         elif np.ndim(data) == 3:
             datalist_shuffled.append(shuffle_3D(data, block_len))
     return datalist_shuffled
+
+
+def circular_permute_3D(X):
+    '''
+    Circularly permute X along the time axis for each subject.
+    '''
+    T, _, N = X.shape
+    X_permuted = np.zeros_like(X)
+    for n in range(N):
+        shift = random.randint(0, T // 300) * 300  # Shift by a random multiple of 300 samples (10 seconds) 
+        X_permuted[:,:,n] = np.roll(X[:,:,n], shift, axis=0)
+    return X_permuted
 
 
 def EEG_normalization(data, len_seg):
@@ -783,13 +885,14 @@ def clean_features(feats, smooth=True):
     return y
 
 
-def plot_spatial_resp(forward_model, corr, file_name, fig_size=(10, 4), ifISC=False, idx_sig=None):
+def plot_spatial_resp(forward_model, file_name, fig_size=(10, 4)):
     _, n_components = forward_model.shape
+    forward_model = np.abs(forward_model)
     biosemi_layout = mne.channels.read_layout('biosemi')
     create_info = mne.create_info(biosemi_layout.names, ch_types='eeg', sfreq=30)
     create_info.set_montage('biosemi64')
-    vmax = np.max(np.abs(forward_model))
-    vmin = np.min(np.abs(forward_model))
+    vmax = np.max(forward_model)
+    vmin = np.min(forward_model)
     if n_components < 5:
         n_row = 1
         n_column = n_components
@@ -803,23 +906,87 @@ def plot_spatial_resp(forward_model, corr, file_name, fig_size=(10, 4), ifISC=Fa
     fig.tight_layout()
     fig.subplots_adjust(right=0.8)
     comp = 0
+    if n_components == 1:
+        axes = np.array([axes])
     for ax in axes.flat:
         if comp < n_components:
-            im, _ = mne.viz.plot_topomap(np.abs(forward_model[:,comp]), create_info, ch_type='eeg', axes=ax, show=False, vlim=(vmin, vmax))
-            if idx_sig is not None:
-                color = 'b' if comp in idx_sig else 'black'
-            else:
-                color = 'black'
-            if ifISC:
-                ax.set_title("CC: {order}\n ISC: {corr:.3f}".format(order=comp+1, corr=np.mean(corr[:,comp])), color=color)
-            else:
-                ax.set_title("CC: {order}\n corr: {corr:.3f}".format(order=comp+1, corr=np.mean(corr[:,comp])), color=color)
+            im, _ = mne.viz.plot_topomap(forward_model[:,comp], create_info, ch_type='eeg', axes=ax, show=False, vlim=(vmin, vmax))
+            # if idx_sig is not None:
+            #     color = 'b' if comp in idx_sig else 'black'
+            # else:
+            #     color = 'black'
+            # if ifISC:
+            #     ax.set_title("CC: {order}\n ISC: {corr:.3f}".format(order=comp+1, corr=np.mean(corr[:,comp])), color=color)
+            # else:
+            #     ax.set_title("CC: {order}\n corr: {corr:.3f}".format(order=comp+1, corr=np.mean(corr[:,comp])), color=color)
         else:
             ax.axis('off')
         comp += 1
     cbar_ax = fig.add_axes([0.85, 0.3, 0.02, 0.5])
     fig.colorbar(im, cax=cbar_ax, label='Weight')
     plt.savefig(file_name, dpi=600)
+    plt.close()
+
+
+def plot_three_tasks(task_models_dict, file_name, task_names=["Task 1", "Task 2", "Task 3"], fig_size=(12, 4)):
+    """
+    Plots 3 spatial topographies side-by-side sharing a single colorbar.
+    
+    Inputs:
+    task_models_dict: A dictionary of 1D arrays, e.g., {0: array, 1: array, 2: array} 
+                      (Output from the grand_average function)
+    """
+    # 1. Stack the dictionary arrays into a single 2D array
+    forward_models = np.column_stack([task_models_dict[0], task_models_dict[1], task_models_dict[2]])
+    
+    # Force the maximum absolute peak of every task to be positive (red)
+    for i in range(forward_models.shape[1]):
+        task_map = forward_models[:, i]
+        
+        # Find the index of the largest weight (ignoring sign)
+        peak_idx = np.argmax(np.abs(task_map))
+        
+        # If the actual value at that peak is negative, flip the whole map
+        if task_map[peak_idx] < 0:
+            forward_models[:, i] = -task_map
+    
+    # 2. Setup MNE Info (Biosemi 64)
+    biosemi_layout = mne.channels.read_layout('biosemi')
+    create_info = mne.create_info(biosemi_layout.names, ch_types='eeg', sfreq=30)
+    create_info.set_montage('biosemi64')
+    
+    # 3. Calculate a symmetric global color limit for all subplots
+    # This ensures that 0 is perfectly centered in your colormap
+    max_val = np.max(np.abs(forward_models))
+    vmin, vmax = -max_val, max_val
+    
+    # 4. Create the 1x3 Figure
+    fig, axes = plt.subplots(nrows=1, ncols=3, figsize=fig_size)
+    
+    # 5. Loop through and plot each task
+    for idx, ax in enumerate(axes):
+        im, _ = mne.viz.plot_topomap(
+            forward_models[:, idx], 
+            create_info, 
+            ch_type='eeg', 
+            axes=ax, 
+            show=False, 
+            vlim=(vmin, vmax),
+            cmap='RdBu_r' # Standard divergent colormap for EEG
+        )
+        ax.set_title(task_names[idx], fontsize=20, pad=10)
+        
+    # 6. Add a single, shared colorbar on the right
+    plt.subplots_adjust(left=0.05, right=0.85) # Compress plots to the left
+    cbar_ax = fig.add_axes([0.88, 0.15, 0.035, 0.7]) # [left, bottom, width, height]
+    cbar = fig.colorbar(im, cax=cbar_ax)
+    cbar.set_label('Weight (a.u.)', fontsize=20, labelpad=10)
+    
+    # Make the tick numbers larger
+    cbar.ax.tick_params(labelsize=18)
+    
+    # 7. Save and close
+    plt.savefig(file_name, dpi=600, bbox_inches='tight')
     plt.close()
 
 
@@ -1154,6 +1321,34 @@ def interpolate_blinks(ts, blinks):
     return time_series
     
 
+def pixels_to_dva(radius_in_pixels, distance_to_screen_cm=130, screen_width_cm=48.7, screen_width_px=1920):
+    """
+    Converts a radius in pixels to Degrees of Visual Angle (DVA).
+    """
+    # 1. Calculate how many centimeters one pixel represents
+    cm_per_pixel = screen_width_cm / screen_width_px
+    # 2. Convert the pixel radius into a physical radius (cm)
+    radius_cm = radius_in_pixels * cm_per_pixel
+    # 3. Use trigonometry to find the angle (in radians), then convert to degrees
+    # math.atan2 is safe and returns radians
+    dva_radians = math.atan2(radius_cm, distance_to_screen_cm)
+    dva_degrees = math.degrees(dva_radians)
+    return dva_degrees
+
+
+def fixation_cluster(xy, eps=10, min_samples=5):
+    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(xy)
+    labels = clustering.labels_
+    most_common_label = Counter(labels).most_common(1)[0][0]
+    assert most_common_label != -1, "Most common label is -1, indicating noise."
+    fixation_points = xy[labels == most_common_label]
+    centroid = np.mean(fixation_points, axis=0)
+    distances = np.linalg.norm(fixation_points - centroid, axis=1)
+    radius_px = np.percentile(distances, 95)
+    dva = pixels_to_dva(radius_px)
+    return centroid, dva, labels, most_common_label
+
+
 def get_mask_from_gaze(xy_multitask, saccade_multitask, blink_multitask, eps=10, nb_nearby_samples=None):
     nb_tasks = xy_multitask.shape[2]
     masks = []
@@ -1161,13 +1356,9 @@ def get_mask_from_gaze(xy_multitask, saccade_multitask, blink_multitask, eps=10,
         xy = xy_multitask[:,:,i]
         saccade = saccade_multitask[:,0,i].astype(bool)
         blink = blink_multitask[:,0,i].astype(bool)
-        clustering = DBSCAN(eps=eps, min_samples=5).fit(xy)
-        labels = clustering.labels_
-        # The largest cluster is likely your fixation point
-        most_common_label = Counter(labels).most_common(1)[0][0]
-        assert most_common_label != -1, "Most common label is -1, indicating noise."
+        _, _, labels, most_common_label = fixation_cluster(xy, eps=eps)
         mask_to_discard = labels != most_common_label
-        mask_to_discard = mask_to_discard & ~blink | saccade
+        mask_to_discard = mask_to_discard & ~blink | saccade   
         if nb_nearby_samples is not None:
             original_mask = mask_to_discard.copy()
             for bf in range(1, nb_nearby_samples[0] + 1):

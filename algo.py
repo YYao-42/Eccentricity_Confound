@@ -105,6 +105,25 @@ class CanonicalCorrelationAnalysis:
         corr_coe[corr_coe<0] = -1*corr_coe[corr_coe<0]
         return corr_coe, V_A, V_B, rt_of_not_nan
 
+    def forward_model(self, X, V_A, Y):
+        '''
+        Calculate the forward model of the filters V_A on the data X
+        Y is provided here just to get the correct mask
+        '''
+        nb_tasks = X.shape[2] if np.ndim(X) == 3 else 1
+        forward_models = []
+        for task in range(nb_tasks):
+            mtx_X = utils.block_Hankel(X[:,:,task], self.L_EEG, self.offset_EEG)
+            mtx_Y = utils.block_Hankel(Y[:,:,task], self.L_Stim, self.offset_Stim)
+            mtx_X, _, _ = self.apply_mask(mtx_X, mtx_Y)
+            mtx_X_centered = mtx_X - np.mean(mtx_X, axis=0, keepdims=True)
+            forward_model = mtx_X_centered.T@mtx_X_centered@V_A@LA.inv(V_A.T@mtx_X_centered.T@mtx_X_centered@V_A)
+            forward_model = utils.F_organize(forward_model, self.L_EEG, self.offset_EEG)
+            # forward_model = utils.F_avg_temporal(forward_model, self.L_EEG)
+            forward_models.append(forward_model)
+        forward_models = np.stack(forward_models, axis=2) if nb_tasks > 1 else forward_models[0]
+        return forward_models
+
     def get_transformed_data(self, X, Y, V_A, V_B):
         '''
         Get the transformed data
@@ -183,11 +202,14 @@ class CanonicalCorrelationAnalysis:
                 start_points = np.sort(start_points)
             else:
                 start_points = np.array(range(0, T - T%(self.fs*trial_len), round(self.fs*trial_len*(1-overlap))))
+                # if the last trial is too short, drop it
+                if start_points[-1] + trial_len*self.fs > T and len(start_points) > 1:
+                    start_points = start_points[:-1]
         else:
             start_points = given_start_points
         return start_points
 
-    def cal_corr_compete_trials(self, X, Y_att, V_X, V_Y, BOOTSTRAP, trial_len, given_start_points=None, BTfactor=2, overlap=0.9):
+    def cal_corr_compete_trials(self, X, Y_att, V_X, V_Y, BOOTSTRAP, trial_len, given_start_points=None, BTfactor=2, overlap=0.9, nb_compete=1):
         X_trans, Y_att_trans, _ = self.get_transformed_data(X, Y_att, V_X, V_Y) if np.ndim(X) == 2 else self.get_transformed_data_3D(X, Y_att, V_X, V_Y)
         T = X_trans.shape[0]
         assert T-trial_len*self.fs >= 0, "The trial length is too long."
@@ -195,13 +217,13 @@ class CanonicalCorrelationAnalysis:
         # Note: the data has been transformed
         X_trans_trials = utils.into_trials(X_trans, self.fs, trial_len, start_points=start_points)
         Y_att_trans_trials = utils.into_trials(Y_att_trans, self.fs, trial_len, start_points=start_points)
-        Y_compete_trans_trials = utils.shift_trials(Y_att_trans_trials)
         # Y_compete_trans_trials = utils.shift_trials(Y_att_trans_trials)
+        X_trans_trials, Y_att_trans_trials, Y_compete_trans_trials = utils.match_mismatch_pairs(X_trans_trials, Y_att_trans_trials, nb_compete)
         corr_att_trials, _ = self.cal_corr_coe_trials(X_trans_trials, Y_att_trans_trials, avg=False)
         corr_compete_trials, _ = self.cal_corr_coe_trials(X_trans_trials, Y_compete_trans_trials, avg=False)
         return corr_att_trials, corr_compete_trials, start_points, X_trans_trials, Y_att_trans_trials, Y_compete_trans_trials
     
-    def cal_corr_compete_trials_mask(self, X, Y_att, V_X, V_Y, BOOTSTRAP, trial_len, given_start_points=None, BTfactor=2, overlap=0.9):
+    def cal_corr_compete_trials_mask(self, X, Y_att, V_X, V_Y, BOOTSTRAP, trial_len, given_start_points=None, BTfactor=2, overlap=0.9, nb_compete=1):
         '''First divide data into trials and then apply the mask before calculating the correlation coefficients.'''
         T = X.shape[0]
         assert T-trial_len*self.fs >= 0, "The trial length is too long."
@@ -209,12 +231,13 @@ class CanonicalCorrelationAnalysis:
         # Note: the data has not been transformed
         X_trials = utils.into_trials(X, self.fs, trial_len, start_points=start_points)
         Y_att_trials = utils.into_trials(Y_att, self.fs, trial_len, start_points=start_points)
-        Y_compete_trials = utils.shift_trials(Y_att_trials)
+        # Y_compete_trials = utils.shift_trials(Y_att_trials)
+        X_trials, Y_att_trials, Y_compete_trials = utils.match_mismatch_pairs(X_trials, Y_att_trials, nb_compete)
         corr_att_trials, rts_kept_trials = self.cal_corr_coe_trials(X_trials, Y_att_trials, V_X, V_Y, avg=False)
         corr_compete_trials, _ = self.cal_corr_coe_trials(X_trials, Y_compete_trials, V_X, V_Y, avg=False)
         return corr_att_trials, corr_compete_trials, start_points, X_trials, Y_att_trials, Y_compete_trials, rts_kept_trials
 
-    def cal_corr_compete_mask_trials(self, X, Y_att, V_X, V_Y, BOOTSTRAP, trial_len, BTfactor=2, overlap=0.9):
+    def cal_corr_compete_mask_trials(self, X, Y_att, V_X, V_Y, BOOTSTRAP, trial_len, BTfactor=2, overlap=0.9, nb_compete=1):
         '''First apply the mask and then divide data into trials.'''
         rts_kept = []
         corr_att_trials_tasks = []
@@ -225,12 +248,14 @@ class CanonicalCorrelationAnalysis:
         min_nb_trials = np.inf
         for task in range(X.shape[2]):
             X_trans, Y_trans, rt_of_not_nan = self.get_transformed_data(X[:,:,task], Y_att[:,:,task], V_X, V_Y)
+            assert X_trans.shape[0] == Y_trans.shape[0], "The number of samples in X and Y should be the same after transformation."
             rts_kept.append(rt_of_not_nan)
             T = X_trans.shape[0]
             start_points = self.get_start_points(T, trial_len, BOOTSTRAP, BTfactor, overlap)
             X_trans_trials = utils.into_trials(X_trans, self.fs, trial_len, start_points=start_points)
             Y_att_trans_trials = utils.into_trials(Y_trans, self.fs, trial_len, start_points=start_points)
-            Y_compete_trans_trials = utils.shift_trials(Y_att_trans_trials)
+            # Y_compete_trans_trials = utils.shift_trials(Y_att_trans_trials)
+            X_trans_trials, Y_att_trans_trials, Y_compete_trans_trials = utils.match_mismatch_pairs(X_trans_trials, Y_att_trans_trials, nb_compete)
             corr_att_trials, _ = self.cal_corr_coe_trials(X_trans_trials, Y_att_trans_trials, avg=False)
             corr_compete_trials, _ = self.cal_corr_coe_trials(X_trans_trials, Y_compete_trans_trials, avg=False)
             corr_att_trials_tasks.append(corr_att_trials)
@@ -299,7 +324,7 @@ class CanonicalCorrelationAnalysis:
         # train_list_folds = [[data.transpose(2,0,1).reshape(T*nb_tasks, -1) for data in EEGStim] for EEGStim in train_list_folds]
         return train_list_folds, test_list_folds, nb_tasks
 
-    def cross_val(self):
+    def cross_val(self, PERMU_TEST=False):
         '''
         Cross-validation with leave-one-pair-out; For single-object dataset only
         '''
@@ -310,24 +335,28 @@ class CanonicalCorrelationAnalysis:
         corr_test_fold = np.zeros((nb_folds, n_components, nb_tasks))
         rt_fold = np.zeros((nb_folds, 1, nb_tasks))
         corr_permu_fold = []
-        # forward_model_fold = []
+        forward_model_fold = []
         for idx in range(0, nb_folds):
             [EEG_train, Sti_train], [EEG_test, Sti_test] = train_list_folds[idx], test_list_folds[idx]
             corr_train_fold[idx,:], V_A_train, V_B_train, rt_of_not_nan = self.fit(EEG_train, Sti_train)
             print('Training, Fold {}: {}% of the data is not NaN'.format(idx, rt_of_not_nan*100))
             corr_test_fold[idx,:,:], rt_fold[idx,:,:] = self.cal_corr_coe_3D(EEG_test, Sti_test, V_A_train, V_B_train)
-            # forward_model = self.forward_model(EEG_test, V_A_train)
-            # forward_model_fold.append(forward_model)
-            corr_permu_fold.append(self.permutation_test(EEG_test[:,:,0], Sti_test[:,:,0], V_A=V_A_train, V_B=V_B_train))
-        corr_permu_all = np.concatenate(tuple(corr_permu_fold), axis=0)
-        sig_corr_pool = self.calculate_sig_corr(corr_permu_all, nb_fold=nb_folds)
+            forward_models = self.forward_model(EEG_test, V_A_train, Sti_test)
+            forward_model_fold.append(forward_models)
+            if PERMU_TEST:
+                corr_permu_fold.append(self.permutation_test(EEG_test[:,:,0], Sti_test[:,:,0], V_A=V_A_train, V_B=V_B_train))
+        if PERMU_TEST:
+            corr_permu_all = np.concatenate(tuple(corr_permu_fold), axis=0)
+            sig_corr_pool = self.calculate_sig_corr(corr_permu_all, nb_fold=nb_folds)
+        else:
+            sig_corr_pool = None
         if self.message:
             print('Average correlation coefficients of the top {} components on the training sets: {}'.format(n_components, np.average(corr_train_fold, axis=0)))
             print('Average correlation coefficients of the top {} components on the test sets: {}'.format(n_components, np.average(corr_test_fold, axis=0)))
             print('Significance level: {}'.format(sig_corr_pool))
-        return corr_train_fold, corr_test_fold, sig_corr_pool
+        return corr_train_fold, corr_test_fold, sig_corr_pool, forward_model_fold
 
-    def match_mismatch(self, trial_len, BOOTSTRAP=True, V_eeg=None, V_Stim=None, PERMU_TEST=True, overlap=0.9, given_start_points=None):
+    def match_mismatch(self, trial_len, BOOTSTRAP=True, V_eeg=None, V_Stim=None, PERMU_TEST=True, overlap=0.5, given_start_points=None, nb_compete=1):
         '''
         Match-Mismatch task with leave-one-pair-out
         Always train on match and try to distinguish match from mismatch 
@@ -348,9 +377,9 @@ class CanonicalCorrelationAnalysis:
             else:
                 V_eeg_train, V_feat_train = V_eeg, V_Stim
             if not self.MASK:
-                corr_match_eeg_i, corr_mismatch_eeg_i, start_points, X_trans_trials, Y_att_trans_trials, Y_compete_trans_trials = self.cal_corr_compete_trials(EEG_test, Sti_test, V_eeg_train, V_feat_train, BOOTSTRAP, trial_len, given_start_points=start_points, overlap=overlap) 
+                corr_match_eeg_i, corr_mismatch_eeg_i, start_points, X_trans_trials, Y_att_trans_trials, Y_compete_trans_trials = self.cal_corr_compete_trials(EEG_test, Sti_test, V_eeg_train, V_feat_train, BOOTSTRAP, trial_len, given_start_points=start_points, overlap=overlap, nb_compete=nb_compete) 
             else:
-                corr_match_eeg_i, corr_mismatch_eeg_i, X_trans_trials, Y_att_trans_trials, Y_compete_trans_trials, rts = self.cal_corr_compete_mask_trials(EEG_test, Sti_test, V_eeg_train, V_feat_train, BOOTSTRAP, trial_len, overlap=overlap) 
+                corr_match_eeg_i, corr_mismatch_eeg_i, X_trans_trials, Y_att_trans_trials, Y_compete_trans_trials, rts = self.cal_corr_compete_mask_trials(EEG_test, Sti_test, V_eeg_train, V_feat_train, BOOTSTRAP, trial_len, overlap=overlap, nb_compete=nb_compete) 
             X_all_trials = X_trans_trials + X_all_trials
             Y_att_all_trials = Y_att_trans_trials + Y_att_all_trials
             Y_compete_all_trials = Y_compete_trans_trials + Y_compete_all_trials
@@ -363,12 +392,17 @@ class CanonicalCorrelationAnalysis:
         if self.MASK:
             rts_kept = np.concatenate(tuple(rts_kept), axis=0)
         if PERMU_TEST:
-            acc_permu_list = self.permutation_test_acc(X_all_trials, Y_att_all_trials, Y_compete_all_trials)
+            # randomly choose nb_trials/nb_compete trials from the original trials to calculate the accuracy
+            idx_trials = random.sample(range(len(X_all_trials)), len(X_all_trials)//nb_compete)
+            X_reduced = [X_all_trials[i] for i in idx_trials]
+            Y_att_reduced = [Y_att_all_trials[i] for i in idx_trials]
+            Y_compete_reduced = [Y_compete_all_trials[i] for i in idx_trials]
+            acc_permu_list = self.permutation_test_acc(X_reduced, Y_att_reduced, Y_compete_reduced)
         else:
             acc_permu_list = None
         return corr_match_eeg, corr_mismatch_eeg, acc_permu_list, start_points, rts_kept
 
-    def mm_blocks(self, trial_len, BOOTSTRAP=True, overlap=0.9, block_len=90, block_ol=0.8):
+    def mm_blocks(self, trial_len, BOOTSTRAP=True, overlap=0.9, block_len=90, block_ol=0.8, nb_compete=1):
         '''
         Match-Mismatch task with leave-one-pair-out
         Always train on match and try to distinguish match from mismatch 
@@ -387,12 +421,12 @@ class CanonicalCorrelationAnalysis:
             for i, (eeg, sti) in enumerate(zip(EEG_blocks, Sti_blocks)):
                 if not self.MASK:
                     try:
-                        corr_match_eeg_i, corr_mismatch_eeg_i, _, _, _, _ = self.cal_corr_compete_trials(eeg, sti, V_eeg_train, V_feat_train, BOOTSTRAP, trial_len, overlap=overlap) 
+                        corr_match_eeg_i, corr_mismatch_eeg_i, _, _, _, _ = self.cal_corr_compete_trials(eeg, sti, V_eeg_train, V_feat_train, BOOTSTRAP, trial_len, overlap=overlap, nb_compete=nb_compete) 
                     except:
                         continue
                 else:
                     try:
-                        corr_match_eeg_i, corr_mismatch_eeg_i, _, _, _, rts_i = self.cal_corr_compete_mask_trials(eeg, sti, V_eeg_train, V_feat_train, BOOTSTRAP, trial_len, overlap=overlap) 
+                        corr_match_eeg_i, corr_mismatch_eeg_i, _, _, _, rts_i = self.cal_corr_compete_mask_trials(eeg, sti, V_eeg_train, V_feat_train, BOOTSTRAP, trial_len, overlap=overlap, nb_compete=nb_compete) 
                     except:
                         continue
                 if i not in corr_match_dict:
@@ -411,7 +445,7 @@ class GeneralizedCCA:
     '''
     Perform GCCA on data of different subjects. If subjects have multi-modal data, then the data are concatenated along the channel axis.
     '''
-    def __init__(self, EEG_list, fs, L, offset, hankelized=False, dim_list=None, task_train=[2,3], leave_out=1, n_components=5, regularization='lwcov', message=True, signifi_level=True, n_permu=500, p_value=0.05, save_W_perfold=False, EEG_list_masked=None):
+    def __init__(self, EEG_list, fs, L, offset, hankelized=False, dim_list=None, task_train=[2,3], leave_out=1, n_components=5, regularization='lwcov', message=True, signifi_level=True, n_permu=500, p_value=0.05, save_W_perfold=True, EEG_list_masked=None):
         '''
         EEG_list: list of EEG data, each element is a T(#sample)xDx(#channel)xN(#subj)x(#task) array corresponding to a video 
         fs: Sampling rate
@@ -539,13 +573,16 @@ class GeneralizedCCA:
         Get the transformed data
         '''
         _, _, N = X_stack.shape
-        if np.ndim (W_stack) == 2: # for correlated component analysis
-            W_stack = np.expand_dims(W_stack, axis=1)
-            W_stack = np.repeat(W_stack, N, axis=1)
         Hankellist = [np.expand_dims(self.apply_mask(utils.block_Hankel(X_stack[:,:,n], self.L, self.offset)), axis=2) for n in range(N)]
         Hankel_center = [hankel - np.mean(hankel, axis=0, keepdims=True) for hankel in Hankellist]
         X_center = np.concatenate(tuple(Hankel_center), axis=2)
-        X_trans = np.einsum('tdn,dkn->tkn', X_center, np.transpose(W_stack, (0,2,1)))
+        if W_stack is not None:
+            if np.ndim (W_stack) == 2: # for correlated component analysis
+                W_stack = np.expand_dims(W_stack, axis=1)
+                W_stack = np.repeat(W_stack, N, axis=1)
+            X_trans = np.einsum('tdn,dkn->tkn', X_center, np.transpose(W_stack, (0,2,1)))
+        else:
+            X_trans = X_center
         return X_trans
     
     def get_transformed_data_4D(self, X_stack, W_stack):
@@ -574,6 +611,24 @@ class GeneralizedCCA:
             corr_mtx_stack[:,:,component] = np.corrcoef(X_trans[:,component,:], rowvar=False)
             avg_corr[component] = np.sum(corr_mtx_stack[:,:,component]-np.eye(N))/N/(N-1)
         return avg_corr
+    
+    def cal_avg_cov(self, X_stack, W_stack=None):
+        '''
+        Calculate the inter-subject covariance (average pairwise covariance)
+        '''
+        if W_stack is None:
+            X_trans = X_stack
+        else:
+            X_trans = self.get_transformed_data(X_stack, W_stack)
+        _, _, N = X_trans.shape
+        n_components = self.n_components
+        cov_mtx_stack = np.zeros((N,N,n_components))
+        avg_cov = np.zeros(n_components)
+        for component in range(n_components):
+            cov_mtx_stack[:,:,component] = np.cov(X_trans[:,component,:], rowvar=False)
+            cov_diag = np.diag(np.diag(cov_mtx_stack[:,:,component]))
+            avg_cov[component] = np.sum(cov_mtx_stack[:,:,component]-cov_diag)/N/(N-1)
+        return avg_cov
 
     def cal_avg_corr_coe_4D(self, X_stack, W_stack=None):
         assert np.ndim(X_stack) == 4, "The input data should be 4D."
@@ -584,6 +639,15 @@ class GeneralizedCCA:
         avg_corr = np.stack(corr_all, axis=1) # (n_components, nb_tasks)
         return avg_corr
 
+    def cal_avg_cov_4D(self, X_stack, W_stack=None):
+        assert np.ndim(X_stack) == 4, "The input data should be 4D."
+        cov_all = []
+        for task in range(X_stack.shape[3]):
+            avg_cov = self.cal_avg_cov(X_stack[:,:,:,task], W_stack)
+            cov_all.append(avg_cov)
+        avg_cov = np.stack(cov_all, axis=1) # (n_components, nb_tasks)
+        return avg_cov
+
     def cal_avg_corr_coe_trials(self, X_trials, W_stack=None, avg=True):
         Four_D = np.ndim(X_trials[0]) == 4
         corr_coe_trials = [self.cal_avg_corr_coe(X, W_stack) for X in X_trials] if not Four_D else [self.cal_avg_corr_coe_4D(X, W_stack) for X in X_trials]
@@ -592,14 +656,17 @@ class GeneralizedCCA:
             corr_coe = np.mean(corr_coe, axis=0)
         return corr_coe
 
-    def permutation_test(self, X_stack, W_stack, PHASE_SCRAMBLE=True, block_len=None):
+    def permutation_test(self, X_stack, W_stack, PHASE_SCRAMBLE=True):
         corr_coe_topK = np.empty((0, self.n_components))
+        cov_topK = np.empty((0, self.n_components))
         X_trans = self.get_transformed_data(X_stack, W_stack)
         for i in tqdm(range(self.n_permu)):
-            X_shuffled = utils.shuffle_3D(X_trans, block_len) if not PHASE_SCRAMBLE else utils.phase_scramble_3D(X_trans)
+            X_shuffled = utils.circular_permute_3D(X_trans) if not PHASE_SCRAMBLE else utils.phase_scramble_3D(X_trans)
             corr_coe = self.cal_avg_corr_coe(X_shuffled)
+            cov = self.cal_avg_cov(X_shuffled)
             corr_coe_topK = np.concatenate((corr_coe_topK, np.expand_dims(corr_coe, axis=0)), axis=0)
-        return corr_coe_topK
+            cov_topK = np.concatenate((cov_topK, np.expand_dims(cov, axis=0)), axis=0)
+        return corr_coe_topK, cov_topK
 
     def calculate_sig_corr(self, corr_trials, nb_fold=1):
         assert self.n_components*self.n_permu*nb_fold == corr_trials.shape[0]*corr_trials.shape[1]
@@ -613,8 +680,8 @@ class GeneralizedCCA:
         assert self.n_permu*nb_fold == corr_agg.shape[0]
         sig_idx = -int(self.n_permu*self.p_value*nb_fold)
         return corr_agg[sig_idx]
-    
-    def cross_val(self, CORRCA=True):
+
+    def cross_val(self, CORRCA=True, sig_components=2):
         train_list_folds, test_list_folds, nb_tasks = self.get_train_test_data()
         if self.EEG_list_masked is not None:
             _, test_list_folds, _ = self.get_train_test_data(MASKED=True)
@@ -622,28 +689,44 @@ class GeneralizedCCA:
         nb_folds = self.nb_folds
         corr_train_fold = np.zeros((nb_folds, n_components))
         corr_test_fold = np.zeros((nb_folds, n_components, nb_tasks))
+        cov_train_fold = np.zeros((nb_folds, n_components))
+        cov_test_fold = np.zeros((nb_folds, n_components, nb_tasks))
         corr_permu_fold = []
+        cov_permu_fold = []
         for idx in range(0, nb_folds):
             [EEG_train], [EEG_test] = train_list_folds[idx], test_list_folds[idx]
             W_train, _, F, _ = self.fit(EEG_train) if not CORRCA else self.fit_corrca(EEG_train)
             corr_train_fold[idx,:] = self.cal_avg_corr_coe(EEG_train, W_train)
             corr_test_fold[idx,:,:] = self.cal_avg_corr_coe_4D(EEG_test, W_train)
+            cov_train_fold[idx,:] = self.cal_avg_cov(EEG_train, W_train)
+            cov_test_fold[idx,:,:] = self.cal_avg_cov_4D(EEG_test, W_train)
+            if self.save_W_perfold:
+                self.test_list.append(EEG_test)
+                self.W_train_list.append(W_train)
             if self.signifi_level:
-                corr_permu_fold.append(self.permutation_test(EEG_test[:,:,:,0], W_train))
+                corr_permu, cov_permu = self.permutation_test(EEG_test[:,:,:,0], W_train, PHASE_SCRAMBLE=False)
+                corr_permu_fold.append(corr_permu)
+                cov_permu_fold.append(cov_permu)
         if self.signifi_level:
-            sig_corr_fold = [self.calculate_sig_multi_comp(corr_permu) for corr_permu in corr_permu_fold]
+            sig_corr_fold = [self.calculate_sig_multi_comp(corr_permu, nb_components=sig_components) for corr_permu in corr_permu_fold]
             corr_permu_all = np.concatenate(tuple(corr_permu_fold), axis=0)
-            sig_corr_pool = self.calculate_sig_multi_comp(corr_permu_all, nb_fold=nb_folds)
+            sig_corr_pool = self.calculate_sig_multi_comp(corr_permu_all, nb_fold=nb_folds, nb_components=sig_components)
+            cov_permu_all = np.concatenate(tuple(cov_permu_fold), axis=0)
+            sig_cov_pool = self.calculate_sig_multi_comp(cov_permu_all, nb_fold=nb_folds, nb_components=1)
         else:
             sig_corr_fold = None
             sig_corr_pool = None
+            sig_cov_pool = None
         if self.message:
-            print('Average ISC of the top {} components on the training sets: {}'.format(n_components, np.average(corr_train_fold, axis=0)))
+            # print('Average ISC of the top {} components on the training sets: {}'.format(n_components, np.average(corr_train_fold, axis=0)))
             print('Average ISC of the top {} components on the test sets: {}'.format(n_components, np.average(corr_test_fold, axis=0)))
-            print('Significance level (CC1+CC2): {}'.format(sig_corr_pool))
-        return corr_train_fold, corr_test_fold, sig_corr_fold, sig_corr_pool, F
+            # print('Average ISCov of the top {} components on the training sets: {}'.format(n_components, np.average(cov_train_fold, axis=0)))
+            print('Average ISCov of the top {} components on the test sets: {}'.format(n_components, np.average(cov_test_fold, axis=0)))
+            print('Significance level (Corr, CC1+CC2): {}'.format(sig_corr_pool))
+            print('Significance level (Cov): {}'.format(sig_cov_pool))
+        return corr_train_fold, corr_test_fold, sig_corr_fold, sig_corr_pool, F, cov_train_fold, cov_test_fold
     
-    def cross_val_trials(self, BOOTSTRAP, trial_len, given_start_points=None, BTfactor=2, overlap=0.9, CORRCA=True):
+    def cross_val_trials(self, BOOTSTRAP, trial_len, given_start_points=None, BTfactor=2, overlap=0.5, CORRCA=True):
         train_list_folds, test_list_folds, nb_tasks = self.get_train_test_data()
         if self.EEG_list_masked is not None:
             _, test_list_folds, _ = self.get_train_test_data(MASKED=True)
@@ -653,6 +736,9 @@ class GeneralizedCCA:
         for idx in range(0, nb_folds):
             [EEG_train], [EEG_test] = train_list_folds[idx], test_list_folds[idx]
             W_train, _, F, _ = self.fit(EEG_train) if not CORRCA else self.fit_corrca(EEG_train)
+            if self.save_W_perfold:
+                self.test_list.append(EEG_test)
+                self.W_train_list.append(W_train)
             T = EEG_test.shape[0]
             assert T-trial_len*self.fs >= 0, "The trial length is too long."
             if given_start_points is None:
@@ -685,9 +771,26 @@ class GeneralizedCCA:
             enhanced_list.append(EEG_enhanced)
         return enhanced_list
 
+    def forward_model(self):
+        assert self.save_W_perfold, "Please set save_W_perfold=True when initializing the class."
+        forward_model_list = []
+        for EEG_test, W_train in zip(self.test_list, self.W_train_list):
+            fm_tasks = []
+            nb_tasks = EEG_test.shape[-1]
+            for task in range(nb_tasks):
+                EEG_trans = self.get_transformed_data(EEG_test[..., task], W_train)
+                EEG_task = self.get_transformed_data(EEG_test[..., task], None)
+                EEG_flat = np.concatenate([EEG_task[:, :, n] for n in range(nb_tasks)], axis=0)
+                EEG_trans_flat = np.concatenate([EEG_trans[:, :, n] for n in range(nb_tasks)], axis=0)
+                fm_redun = EEG_flat.T @ EEG_trans_flat @ LA.inv(EEG_trans_flat.T @ EEG_trans_flat)
+                fm_tasks.append(utils.F_organize(fm_redun, self.L, self.offset))
+            F = np.stack(fm_tasks, axis=2)
+            forward_model_list.append(F)
+        return forward_model_list
+
 
 class BlockCCA:
-    def __init__(self, list_X, list_Y, fs, L, offset, sharefilter='set', hankelized=False, leave_out=1, n_components=5, regularization='lwcov', message=True, signifi_level=True, n_permu=500, p_value=0.05, save_W_perfold=False):
+    def __init__(self, list_X, list_Y, fs, L, offset, sharefilter='set', hankelized=False, leave_out=1, n_components=5, regularization='lwcov', message=True, signifi_level=True, n_permu=500, p_value=0.05, save_W_perfold=True):
         '''
         list_X, list_Y: lists of data, each element is a T(#sample)xDx(#channel)xN(#subj) array corresponding to a video 
         fs: Sampling rate
@@ -824,4 +927,22 @@ class BlockCCA:
             W_train = self.fit(setA_train, setB_train)
             corr_train_folds.append(self.cal_avg_corr_coe(setA_train, setB_train, W_train))
             corr_test_folds.append(self.cal_avg_corr_coe(setA_test, setB_test, W_train))
+            if self.save_W_perfold:
+                self.test_list.append(test_list_folds[idx])
+                self.W_train_list.append(W_train)
         return corr_train_folds, corr_test_folds
+    
+    def forward_model(self):
+        assert self.save_W_perfold, "Please set save_W_perfold=True when initializing the class."
+        fm_A_list = []
+        fm_B_list = []
+        for set_AB_test, W_train in zip(self.test_list, self.W_train_list):
+            setA_test, setB_test = set_AB_test
+            setA_trans, setB_trans = self.get_transformed_data(setA_test, setB_test, W_train)
+            shared_A = np.mean(setA_trans, axis=2)
+            shared_B = np.mean(setB_trans, axis=2)
+            F_A = np.transpose(setA_test, (1, 2, 0)) @ shared_A @ LA.inv(shared_A.T @ shared_A)
+            F_B = np.transpose(setB_test, (1, 2, 0)) @ shared_B @ LA.inv(shared_B.T @ shared_B)
+            fm_A_list.append(F_A.mean(axis=1)) # average across subjects
+            fm_B_list.append(F_B.mean(axis=1)) # average across subjects
+        return fm_A_list, fm_B_list
