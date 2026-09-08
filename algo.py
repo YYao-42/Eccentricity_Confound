@@ -154,6 +154,24 @@ class CanonicalCorrelationAnalysis:
         rts_of_not_nan = None
         return X_trans, Y_trans, rts_of_not_nan
 
+    def get_transformed_data_indexed(self, X, Y, V_A, V_B):
+        '''
+        Same as get_transformed_data, but also returns the indices, w.r.t. the original time axis,
+        of the samples that survived the mask. They are needed to tell which part of the video a
+        transformed sample comes from, once the masked samples have been discarded.
+        '''
+        mtx_X = utils.block_Hankel(X, self.L_EEG, self.offset_EEG)
+        mtx_Y = utils.block_Hankel(Y, self.L_Stim, self.offset_Stim)
+        idx_kept = np.where(~np.isnan(mtx_X).any(axis=1) & ~np.isnan(mtx_Y).any(axis=1))[0]
+        mtx_X = mtx_X[idx_kept, :]
+        mtx_Y = mtx_Y[idx_kept, :]
+        rt_of_not_nan = len(idx_kept)/X.shape[0]
+        mtx_X_centered = mtx_X - np.mean(mtx_X, axis=0, keepdims=True)
+        mtx_Y_centered = mtx_Y - np.mean(mtx_Y, axis=0, keepdims=True)
+        X_trans = mtx_X_centered@V_A
+        Y_trans = mtx_Y_centered@V_B
+        return X_trans, Y_trans, idx_kept, rt_of_not_nan
+
     def cal_corr_coe(self, X, Y, V_A=None, V_B=None):
         '''
         Same as get_corr_coe but with the input of the data and the filters
@@ -438,6 +456,144 @@ class CanonicalCorrelationAnalysis:
                     corr_mismatch_dict[i] = np.concatenate((corr_mismatch_dict[i], corr_mismatch_eeg_i), axis=0)
                     if self.MASK:
                         rts_kept_dict[i] = np.concatenate((rts_kept_dict[i], rts_i), axis=0)
+        return corr_match_dict, corr_mismatch_dict, rts_kept_dict
+
+    def get_mismatch_pool(self, test_indices, V_X, V_Y, nb_tasks):
+        '''
+        Transform the stimulus of the videos that are not in the test set, to be used as a pool of
+        competing segments. A segment taken from another video was, by construction, not on the
+        screen during the match trial, and the size of the pool no longer depends on the length of
+        the block, nor on the length of the test video.
+        Note that the videos of the pool are the ones the filters were trained on. Only their
+        stimulus is used here, which is not related in time to the EEG of the test video.
+        Inputs:
+        test_indices: indices of the videos that are left out for testing in the current fold
+        Output:
+        A list (one element per task) of lists of transformed stimuli, one per video of the pool
+        '''
+        EEG_list = self.EEG_masked if self.MASK else self.EEG_list
+        Stim_list = self.Stim_masked if self.MASK else self.Stim_list
+        pool_tasks = [[] for _ in range(nb_tasks)]
+        for idx_video in range(self.nb_videos):
+            if idx_video in test_indices:
+                continue
+            for task in range(nb_tasks):
+                _, Y_trans, _, _ = self.get_transformed_data_indexed(EEG_list[idx_video][:,:,task], Stim_list[idx_video][:,:,task], V_X, V_Y)
+                pool_tasks[task].append(Y_trans)
+        return pool_tasks
+
+    def cal_corr_compete_blocks(self, X, Y_att, V_X, V_Y, block_start_points, block_len, trial_len, Y_pool_tasks=None, BOOTSTRAP=True, BTfactor=2, overlap=0.9, nb_compete=1, guard_len=None):
+        '''
+        Same purpose as cal_corr_compete_mask_trials, but the competing segments are not drawn from
+        the block the match trial belongs to. The mask is applied to the whole recording first, and
+        each block is then located on the retained time axis, such that a match trial still comes
+        from its own block, while the diversity of the competing segments no longer shrinks when
+        the block gets short after masking.
+        Inputs:
+        block_start_points: start points of the blocks, on the original time axis
+        block_len/trial_len: length of the blocks/trials in seconds
+        Y_pool_tasks: if given (see get_mismatch_pool), the competing segments are drawn from this
+        pool of other videos; if None, they are drawn from the test video itself, at least
+        guard_samples away from the matched segment
+        guard_len: only used when Y_pool_tasks is None; minimum distance (s) between a match trial
+        and its competitors, defaults to trial_len, i.e., no overlap at all. Match trials for which
+        the test video is too short to provide such a competitor are discarded
+        Outputs:
+        Dictionaries, indexed by the block index, of the correlation coefficients with the matched
+        and the competing segments, and of the ratio of data kept in each block
+        '''
+        nb_tasks = X.shape[2]
+        T = X.shape[0]
+        block_len_samples = int(block_len*self.fs)
+        trial_len_samples = int(trial_len*self.fs)
+        guard_samples = trial_len_samples if guard_len is None else int(guard_len*self.fs)
+        # transform the whole recording once per task and keep track of the samples that survived the mask
+        X_trans_tasks = []
+        Y_trans_tasks = []
+        idx_kept_tasks = []
+        for task in range(nb_tasks):
+            X_trans, Y_trans, idx_kept, _ = self.get_transformed_data_indexed(X[:,:,task], Y_att[:,:,task], V_X, V_Y)
+            X_trans_tasks.append(X_trans)
+            Y_trans_tasks.append(Y_trans)
+            idx_kept_tasks.append(idx_kept)
+        corr_match_blocks = {}
+        corr_mismatch_blocks = {}
+        rts_blocks = {}
+        for idx_block, block_start in enumerate(block_start_points):
+            bounds = [utils.retained_block_bounds(idx_kept, block_start, block_len_samples) for idx_kept in idx_kept_tasks]
+            # skip the block if any task does not have enough data left in it after masking
+            if any(hi - lo <= trial_len_samples for lo, hi in bounds):
+                continue
+            match_starts_tasks = []
+            for lo, hi in bounds:
+                starts = self.get_start_points(hi-lo, trial_len, BOOTSTRAP=BOOTSTRAP, BTfactor=BTfactor, overlap=overlap)
+                starts = lo + starts[starts + trial_len_samples <= hi - lo]
+                match_starts_tasks.append(starts)
+            # keep the same number of match trials for every task, since the results are stacked along the task axis
+            min_nb_trials = min([len(starts) for starts in match_starts_tasks])
+            if min_nb_trials == 0:
+                continue
+            indices = [np.sort(random.sample(range(len(starts)), min_nb_trials)) for starts in match_starts_tasks]
+            match_starts_tasks = [starts[ind] for starts, ind in zip(match_starts_tasks, indices)]
+            corr_match_tasks = []
+            corr_mismatch_tasks = []
+            rts_tasks = []
+            for task in range(nb_tasks):
+                X_trans, Y_trans = X_trans_tasks[task], Y_trans_tasks[task]
+                if Y_pool_tasks is None:
+                    match_starts, mismatch_starts = utils.sample_mismatch_starts(match_starts_tasks[task], X_trans.shape[0], trial_len_samples, nb_compete, guard_samples)
+                    Y_mismatch_trials = utils.into_trials(Y_trans, self.fs, trial_len, start_points=mismatch_starts)
+                else:
+                    Y_pool = Y_pool_tasks[task]
+                    match_starts, picks = utils.sample_mismatch_from_pool(match_starts_tasks[task], [Y.shape[0] for Y in Y_pool], trial_len_samples, nb_compete)
+                    Y_mismatch_trials = [Y_pool[idx_pool][start:start+trial_len_samples, :] for idx_pool, start in picks]
+                if len(match_starts) == 0:
+                    continue
+                X_trials = utils.into_trials(X_trans, self.fs, trial_len, start_points=match_starts)
+                Y_match_trials = utils.into_trials(Y_trans, self.fs, trial_len, start_points=match_starts)
+                corr_match, _ = self.cal_corr_coe_trials(X_trials, Y_match_trials, avg=False)
+                corr_mismatch, _ = self.cal_corr_coe_trials(X_trials, Y_mismatch_trials, avg=False)
+                corr_match_tasks.append(corr_match)
+                corr_mismatch_tasks.append(corr_mismatch)
+                lo, hi = bounds[task]
+                rts_tasks.append((hi-lo)/(min(T, block_start+block_len_samples)-block_start))
+            if len(corr_match_tasks) < nb_tasks:
+                continue
+            nb_pairs = min([corr.shape[0] for corr in corr_match_tasks])
+            corr_match_blocks[idx_block] = np.stack([corr[:nb_pairs] for corr in corr_match_tasks], axis=2)
+            corr_mismatch_blocks[idx_block] = np.stack([corr[:nb_pairs] for corr in corr_mismatch_tasks], axis=2)
+            rts_blocks[idx_block] = np.array(rts_tasks).reshape(1, -1)
+        return corr_match_blocks, corr_mismatch_blocks, rts_blocks
+
+    def mm_blocks_global_mismatch(self, trial_len, BOOTSTRAP=True, overlap=0.9, block_len=90, block_ol=0.8, nb_compete=1, mismatch_scope='other_videos', guard_len=None):
+        '''
+        Same as mm_blocks, except that the competing segments are not drawn from the block the
+        match trial belongs to (see cal_corr_compete_blocks)
+        mismatch_scope: 'other_videos' to draw them from the videos that are not being tested in
+        the current fold, 'test_video' to draw them from the test video itself, at least guard_len
+        seconds away from the matched segment
+        '''
+        assert mismatch_scope in ['other_videos', 'test_video'], "mismatch_scope should be 'other_videos' or 'test_video'."
+        train_list_folds, test_list_folds, nb_tasks = self.get_train_test_data()
+        corr_match_dict = {}
+        corr_mismatch_dict = {}
+        rts_kept_dict = {}
+        for idx in range(0, self.nb_folds):
+            [EEG_train, Sti_train], [EEG_test, Sti_test] = train_list_folds[idx], test_list_folds[idx]
+            _, V_eeg_train, V_feat_train, _ = self.fit(EEG_train, Sti_train)
+            test_indices = range(idx*self.leave_out, (idx+1)*self.leave_out)
+            Y_pool_tasks = self.get_mismatch_pool(test_indices, V_eeg_train, V_feat_train, nb_tasks) if mismatch_scope == 'other_videos' else None
+            block_start_points = self.get_start_points(EEG_test.shape[0], block_len, BOOTSTRAP=False, overlap=block_ol)
+            corr_match_blocks, corr_mismatch_blocks, rts_blocks = self.cal_corr_compete_blocks(EEG_test, Sti_test, V_eeg_train, V_feat_train, block_start_points, block_len, trial_len, Y_pool_tasks=Y_pool_tasks, BOOTSTRAP=BOOTSTRAP, overlap=overlap, nb_compete=nb_compete, guard_len=guard_len)
+            for i in corr_match_blocks:
+                if i not in corr_match_dict:
+                    corr_match_dict[i] = corr_match_blocks[i]
+                    corr_mismatch_dict[i] = corr_mismatch_blocks[i]
+                    rts_kept_dict[i] = rts_blocks[i]
+                else:
+                    corr_match_dict[i] = np.concatenate((corr_match_dict[i], corr_match_blocks[i]), axis=0)
+                    corr_mismatch_dict[i] = np.concatenate((corr_mismatch_dict[i], corr_mismatch_blocks[i]), axis=0)
+                    rts_kept_dict[i] = np.concatenate((rts_kept_dict[i], rts_blocks[i]), axis=0)
         return corr_match_dict, corr_mismatch_dict, rts_kept_dict
 
 

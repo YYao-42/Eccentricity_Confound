@@ -1,6 +1,7 @@
 import numpy as np
 import random
 import mne
+import ast
 import scipy.io
 import matplotlib.pyplot as plt
 import copy
@@ -398,6 +399,80 @@ def match_mismatch_pairs(X_trials, Y_trials, nb_mismatch):
     matches_Y = [Y_trials[i] for i in match_indices_list]
     mismatches_Y = [Y_trials[i] for i in mismatch_indices_list]
     return matches_X, matches_Y, mismatches_Y
+
+
+def retained_block_bounds(idx_kept, block_start, block_len_samples):
+    '''
+    Locate a block, which is defined on the original time axis, on the retained time axis,
+    i.e., after the masked (NaN) samples have been discarded.
+    Inputs:
+    idx_kept: sorted indices, w.r.t. the original time axis, of the samples that survived the mask
+    block_start/block_len_samples: start and length of the block, in samples of the original time axis
+    Output:
+    (lo, hi): the half-open range of retained samples that belong to the block
+    '''
+    lo = int(np.searchsorted(idx_kept, block_start, side='left'))
+    hi = int(np.searchsorted(idx_kept, block_start + block_len_samples, side='left'))
+    return lo, hi
+
+
+def sample_mismatch_starts(match_starts, nb_samples, trial_len_samples, nb_mismatch, guard_samples=None):
+    '''
+    Given the start points of a set of match trials, draw nb_mismatch competing segments per
+    match trial from the whole recording, instead of from the block the match trial belongs to
+    (which is what select_mismatches does). A candidate is only kept if it is at least
+    guard_samples away from its match trial, so that a short block does not force the competing
+    segment to be a near copy of the matched one.
+    Inputs:
+    match_starts: start points of the match trials, on the retained time axis
+    nb_samples: number of retained samples available to draw the competing segments from
+    guard_samples: minimum distance between a match trial and its competitors; defaults to
+    trial_len_samples, i.e., the competing segment does not overlap the matched one at all
+    Outputs:
+    The start points of the match trials, each repeated nb_mismatch times, and the start points
+    of the corresponding mismatch trials
+    '''
+    guard_samples = trial_len_samples if guard_samples is None else guard_samples
+    candidates = np.arange(0, nb_samples - trial_len_samples + 1)
+    match_starts_list = []
+    mismatch_starts_list = []
+    for start in match_starts:
+        pool = candidates[np.abs(candidates - start) >= guard_samples]
+        # a match trial for which the recording is too short to provide a distant enough
+        # competing segment is discarded, rather than paired with a near copy of itself
+        if len(pool) == 0:
+            continue
+        nb_kept = min(nb_mismatch, len(pool))
+        mismatch_starts_list.extend(random.sample(list(pool), nb_kept))
+        match_starts_list.extend([start]*nb_kept)
+    return match_starts_list, mismatch_starts_list
+
+
+def sample_mismatch_from_pool(match_starts, pool_lengths, trial_len_samples, nb_mismatch):
+    '''
+    Draw nb_mismatch competing segments per match trial from a pool of other recordings (e.g. the
+    videos that were not on the screen during the match trial), so that the diversity of the
+    competing segments does not depend on the length of the block, nor on the length of the video
+    the match trial comes from. Every recording of the pool is drawn from with a probability
+    proportional to the number of segments it can provide.
+    Inputs:
+    match_starts: start points of the match trials
+    pool_lengths: number of samples of each recording of the pool
+    Outputs:
+    The start points of the match trials, each repeated nb_mismatch times, and the corresponding
+    (index of the recording in the pool, start point) pairs of the mismatch trials
+    '''
+    nb_starts = np.array([L - trial_len_samples + 1 for L in pool_lengths])
+    idx_valid = np.where(nb_starts > 0)[0]
+    assert len(idx_valid) > 0, "None of the recordings of the pool is long enough to provide a competing segment."
+    prob = nb_starts[idx_valid]/np.sum(nb_starts[idx_valid])
+    match_starts_list = []
+    picks = []
+    for start in match_starts:
+        idx_pool = np.random.choice(idx_valid, size=nb_mismatch, p=prob)
+        picks.extend([(int(i), int(np.random.randint(0, nb_starts[i]))) for i in idx_pool])
+        match_starts_list.extend([start]*nb_mismatch)
+    return match_starts_list, picks
 
 
 def split_multi_mod_LVO(nested_datalist, leave_out=2):
@@ -1350,6 +1425,7 @@ def fixation_cluster(xy, eps=10, min_samples=5):
 
 
 def get_mask_from_gaze(xy_multitask, saccade_multitask, blink_multitask, eps=10, nb_nearby_samples=None):
+    '''create a mask for each task based on the gaze data, saccades, and blinks. The mask will be True for points that are identified as gaze shifts'''
     nb_tasks = xy_multitask.shape[2]
     masks = []
     for i in range(nb_tasks):
@@ -1367,6 +1443,47 @@ def get_mask_from_gaze(xy_multitask, saccade_multitask, blink_multitask, eps=10,
                 mask_to_discard[af:] |= original_mask[:-af]
         masks.append(np.expand_dims(mask_to_discard, axis=1))
     return np.stack(masks, axis=2)
+
+
+def create_event_masks(RANDOMIZE, event_type='cross', fs=30, SURROUND=True):
+    '''create a mask for each video based on the events (cross or circle) in the mounted_videos_info.csv file. The mask will be True for points that are considered valid (not during an event) and False otherwise.'''
+    tasks = ['1', '2', '3']
+    mount_info_path_tasks = [rf'C:\Users\yyao\Documents\Experiments\data\SOMove_MultiTask\mounted_videos_info.csv', rf'C:\Users\yyao\Documents\Experiments\data\SOMove_MultiTask\mounted_videos_info.csv', rf'C:\Users\yyao\Documents\Experiments\data\SOMove_MultiTask\mounted_videos_info_3.csv']
+    eeg_path = rf'C:\Users\yyao\Documents\Experiments\data\SOMove_MultiTask\Subj_1'
+    eeg_files_all = [file for file in os.listdir(eeg_path) if file.endswith('.set')]
+    IDs = [int(file[:2]) for file in eeg_files_all if file[-5] == tasks[0]]
+    IDs.sort()
+    mask_videos = []
+    vid_len = 180*fs - 2*fs
+    for id in IDs:
+        dfs = [pd.read_csv(path) for path in mount_info_path_tasks]
+        cross_strings = [df[df['videoID'] == id]['frames_cross'].values[0] for df in dfs]
+        circle_strings = [df[df['videoID'] == id]['frames_circle'].values[0] for df in dfs]
+        cross_info = [ast.literal_eval(cross_string) for cross_string in cross_strings]
+        circle_info = [ast.literal_eval(circle_string) for circle_string in circle_strings]
+        if event_type == 'cross':
+            events_info = cross_info
+        elif event_type == 'circle':
+            events_info = circle_info
+        elif event_type == 'all':
+            events_info = [cross + circle for cross, circle in zip(cross_info, circle_info)]
+        elif event_type == 'None':
+            events_info = [[] for _ in range(len(tasks))]
+        else:
+            raise ValueError("event_type must be 'cross', 'circle', 'all' or 'None'")
+        mask_video = np.ones((vid_len, len(tasks)), dtype=bool)
+        for task_idx, events in enumerate(events_info):
+            nb_events = len(events)
+            if RANDOMIZE:
+                events = np.random.choice(range(vid_len), size=nb_events, replace=False)
+            for event_frame in events:
+                if SURROUND:
+                    tp_range = range(min(max(0, event_frame-fs-fs//4), vid_len), max(0, min(event_frame+fs+fs//2, vid_len))) # -fs is because the first second of data is removed; the cross lasts for 2 seconds; remove extra data before and after the change of cross
+                else:
+                    tp_range = range(min(max(0, event_frame-fs), vid_len), max(0, min(event_frame+fs, vid_len)))
+                mask_video[tp_range, task_idx] = False
+        mask_videos.append(mask_video)
+    return mask_videos
 
 
 def create_corr_df(Subj_ID, sig_corr_pool, corr_att_fold, corr_unatt_fold):
